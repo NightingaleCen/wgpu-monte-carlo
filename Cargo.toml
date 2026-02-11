@@ -1,6 +1,20 @@
 [package]
-name = "wgpu_monte_carlo"
+name = "wgpu-montecarlo"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[lib]
+name = "wgpu_montecarlo"
+crate-type = ["cdylib"]
 
 [dependencies]
+wgpu = "23.0.0"
+bytemuck = { version = "1.22", features = ["derive"] }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+pollster = "0.4"
+anyhow = "1.0"
+numpy = "0.23"
+
+[dependencies.ndarray]
+version = "0.16"
+features = ["rayon"]
