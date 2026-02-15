@@ -22,3 +22,10 @@ features = ["pyo3/extension-module"]
 
 [dependency-groups]
 dev = ["pytest>=8.0", "maturin>=1.8"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501", "F401", "F821"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E731", "F821"]
