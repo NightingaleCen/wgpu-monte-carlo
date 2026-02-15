@@ -2,6 +2,7 @@
 
 import ast
 import inspect
+import linecache
 import sys
 import textwrap
 from typing import Callable, Dict, Set
@@ -18,6 +19,38 @@ if not _PYTHON_SUPPORTS_LAMBDA_POSITIONS:
         UserWarning,
         stacklevel=2,
     )
+
+
+def _cache_source_file(filepath: str | None) -> None:
+    """Cache source file content to prevent reading modified files during runtime.
+
+    Once a source file is cached, subsequent reads will use the cached version
+    even if the file has been modified. This ensures consistency between code
+    positions (co_positions) and source code during transpilation.
+    """
+    if not filepath:
+        return
+    if filepath in linecache.cache:
+        return
+    try:
+        with open(filepath, "r") as f:
+            lines = f.readlines()
+        size = sum(len(line) for line in lines)
+        linecache.cache[filepath] = (size, None, lines, filepath)
+    except OSError:
+        pass
+
+
+_cached_files: Set[str] = set()
+
+
+def _ensure_source_cached(func: Callable) -> None:
+    """Ensure source file is cached for the given function."""
+    global _cached_files
+    source_file = inspect.getsourcefile(func)
+    if source_file and source_file not in _cached_files:
+        _cache_source_file(source_file)
+        _cached_files.add(source_file)
 
 
 class TranspilerError(Exception):
@@ -147,6 +180,9 @@ class PythonToWGSL:
 
     def _transpile_lambda(self, func: Callable) -> str:
         """Transpile a lambda function, handling multiple lambdas on same line."""
+        # Cache source file to prevent reading modified files during runtime
+        _ensure_source_cached(func)
+
         try:
             source = inspect.getsource(func)
         except OSError as e:
