@@ -110,11 +110,20 @@ class PythonToWGSL:
         "step": "step",
         "smoothstep": "smoothstep",
         "pow": "pow",
+        "power": "pow",
+    }
+
+    KNOWN_MODULE_ALIASES: Dict[str, str] = {
+        "np": "numpy",
+        "numpy": "numpy",
+        "math": "math",
     }
 
     def __init__(self):
         self.indent_level = 0
         self.local_vars: Set[str] = set()
+        self.imports: Dict[str, str] = {}
+        self.module_aliases: Dict[str, str] = dict(self.KNOWN_MODULE_ALIASES)
 
     def transpile(self, func: Callable) -> str:
         """
@@ -147,6 +156,18 @@ class PythonToWGSL:
         except SyntaxError as e:
             raise TranspilerError(f"Invalid Python syntax: {e}")
 
+        self._analyze_imports(tree)
+
+        source_file = inspect.getsourcefile(func)
+        if source_file:
+            try:
+                with open(source_file, "r") as f:
+                    full_source = f.read()
+                full_tree = ast.parse(full_source)
+                self._analyze_file_imports(full_tree)
+            except (OSError, SyntaxError):
+                pass
+
         # Find the function definition
         func_def = None
         for node in ast.walk(tree):
@@ -178,6 +199,44 @@ class PythonToWGSL:
 
         return f"fn {name}({param_list}) -> f32 {{\n    {body_str}\n}}"
 
+    def _analyze_imports(self, tree: ast.AST) -> None:
+        """Analyze import statements and build mapping tables."""
+        self.imports.clear()
+        self.module_aliases.clear()
+        self.module_aliases.update(self.KNOWN_MODULE_ALIASES)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = alias.name
+                    alias_name = alias.asname if alias.asname else module_name
+                    self.module_aliases[alias_name] = module_name
+            elif isinstance(node, ast.ImportFrom):
+                module_name = node.module if node.module else ""
+                for alias in node.names:
+                    imported_name = alias.name
+                    alias_name = alias.asname if alias.asname else imported_name
+                    full_name = f"{module_name}.{imported_name}"
+                    self.imports[alias_name] = full_name
+
+    def _analyze_file_imports(self, tree: ast.AST) -> None:
+        """Add file-level import statements without overwriting existing mappings."""
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_name = alias.name
+                    alias_name = alias.asname if alias.asname else module_name
+                    if alias_name not in self.module_aliases:
+                        self.module_aliases[alias_name] = module_name
+            elif isinstance(node, ast.ImportFrom):
+                module_name = node.module if node.module else ""
+                for alias in node.names:
+                    imported_name = alias.name
+                    alias_name = alias.asname if alias.asname else imported_name
+                    full_name = f"{module_name}.{imported_name}"
+                    if alias_name not in self.imports:
+                        self.imports[alias_name] = full_name
+
     def _transpile_lambda(self, func: Callable) -> str:
         """Transpile a lambda function, handling multiple lambdas on same line."""
         # Cache source file to prevent reading modified files during runtime
@@ -199,6 +258,8 @@ class PythonToWGSL:
             tree = ast.parse(source)
         except SyntaxError as e:
             raise TranspilerError(f"Invalid Python syntax: {e}")
+
+        self._analyze_imports(tree)
 
         # Find all lambda nodes
         lambdas = [node for node in ast.walk(tree) if isinstance(node, ast.Lambda)]
@@ -427,12 +488,26 @@ class PythonToWGSL:
 
     def _visit_call(self, node: ast.Call) -> str:
         """Visit a function call."""
+        func_name = None
+
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
+            if func_name in self.imports:
+                full_import = self.imports[func_name]
+                func_name = full_import.split(".")[-1]
         elif isinstance(node.func, ast.Attribute):
-            # Handle math.sin, etc.
-            if isinstance(node.func.value, ast.Name) and node.func.value.id == "math":
-                func_name = node.func.attr
+            if isinstance(node.func.value, ast.Name):
+                module_name = node.func.value.id
+                if module_name in self.module_aliases:
+                    func_name = node.func.attr
+                elif module_name in self.imports:
+                    full_import = self.imports[module_name]
+                    func_name = full_import.split(".")[-1]
+                else:
+                    raise TranspilerError(
+                        f"Unsupported module: {module_name}. "
+                        f"Supported modules: {', '.join(sorted(set(self.module_aliases.values()) | set(k.split('.')[0] for k in self.imports.values())))}"
+                    )
             else:
                 raise TranspilerError(f"Unsupported attribute access: {node.func.attr}")
         else:

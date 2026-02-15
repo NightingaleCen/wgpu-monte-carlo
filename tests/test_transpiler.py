@@ -1,7 +1,8 @@
 """Tests for the WGSL transpiler."""
 
-import pytest
 import math
+import numpy as np
+import pytest
 from wgpu_montecarlo.transpiler import PythonToWGSL, transpile_function, TranspilerError
 
 
@@ -202,6 +203,202 @@ class TestBooleanConversion:
 
         result = transpile_function(is_negative)
         assert "select(0.0, 1.0, (x < 0.0))" in result
+
+
+class TestNumpyImportHandling:
+    """Test numpy import handling with various import styles."""
+
+    def test_np_prefix(self):
+        """Test np.sin(x) style import (import numpy as np)."""
+
+        def step(x):
+            return np.sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_np_prefix_multiple_functions(self):
+        """Test multiple np. function calls."""
+
+        def step(x, y):
+            return np.sin(x) + np.cos(y)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+        assert "cos(y)" in result
+
+    def test_numpy_prefix(self):
+        """Test numpy.sin(x) style import (import numpy)."""
+
+        def step(x):
+            return numpy.sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_from_numpy_import(self):
+        """Test from numpy import sin style."""
+
+        def step(x):
+            return sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_from_numpy_import_multiple(self):
+        """Test from numpy import sin, cos style."""
+
+        def step(x, y):
+            return sin(x) + cos(y)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+        assert "cos(y)" in result
+
+    def test_from_numpy_import_as(self):
+        """Test from numpy import sin as np_sin style."""
+
+        def step(x):
+            return np_sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_mixed_math_and_numpy(self):
+        """Test mixed imports: import numpy as np; from math import cos."""
+
+        def step(x, y):
+            return np.sin(x) + cos(y)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+        assert "cos(y)" in result
+
+    def test_aliased_numpy_module(self):
+        """Test import numpy as n style (custom alias).
+
+        Note: Custom aliases like 'n' require explicit import in function source
+        or adding to KNOWN_MODULE_ALIASES. This test verifies the behavior
+        when alias is NOT in known aliases (should raise error).
+        """
+
+        def step(x):
+            return n.sin(x)
+
+        with pytest.raises(TranspilerError) as exc_info:
+            transpile_function(step)
+        assert "Unsupported module" in str(exc_info.value)
+
+    def test_math_module_attribute(self):
+        """Test math.sin(x) style (original behavior)."""
+
+        def step(x):
+            return math.sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_from_math_import(self):
+        """Test from math import sin style."""
+
+        def step(x):
+            return sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_unsupported_module_error(self):
+        """Test that unsupported modules raise appropriate error."""
+
+        def step(x):
+            return unknown_module.sin(x)
+
+        with pytest.raises(TranspilerError) as exc_info:
+            transpile_function(step)
+        assert "Unsupported module" in str(exc_info.value)
+
+    def test_numpy_sqrt(self):
+        """Test np.sqrt function."""
+
+        def step(x):
+            return np.sqrt(x)
+
+        result = transpile_function(step)
+        assert "sqrt(x)" in result
+
+    def test_numpy_exp(self):
+        """Test np.exp function."""
+
+        def step(x):
+            return np.exp(x)
+
+        result = transpile_function(step)
+        assert "exp(x)" in result
+
+    def test_numpy_power(self):
+        """Test np.power function."""
+
+        def step(x, y):
+            return np.power(x, y)
+
+        result = transpile_function(step)
+        assert "pow(x, y)" in result
+
+
+class TestFileLevelImports:
+    """Test file-level import handling."""
+
+    def test_file_level_import_numpy(self):
+        """Test file-level 'import numpy as np'."""
+        import numpy as np  # noqa: F401
+
+        def step(x):
+            return np.sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_file_level_import_math_as_mma(self):
+        """Test file-level 'import math as mma'."""
+        import math as mma  # noqa: F401
+
+        def step(x):
+            return mma.cos(x)
+
+        result = transpile_function(step)
+        assert "cos(x)" in result
+
+    def test_file_level_import_numpy_direct(self):
+        """Test file-level 'import numpy'."""
+        import numpy  # noqa: F401
+
+        def step(x):
+            return numpy.sqrt(x)
+
+        result = transpile_function(step)
+        assert "sqrt(x)" in result
+
+    def test_file_level_from_import(self):
+        """Test file-level 'from math import sin'."""
+        from math import sin  # noqa: F401
+
+        def step(x):
+            return sin(x)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+
+    def test_file_level_mixed_imports(self):
+        """Test file-level mixed imports from different modules."""
+        import numpy as np  # noqa: F401
+        from math import cos  # noqa: F401
+
+        def step(x, y):
+            return np.sin(x) + cos(y)
+
+        result = transpile_function(step)
+        assert "sin(x)" in result
+        assert "cos(y)" in result
 
 
 if __name__ == "__main__":

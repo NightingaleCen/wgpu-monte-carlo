@@ -93,8 +93,15 @@ Python functions are transpiled to WGSL at runtime. Supported features:
 | `+`, `-`, `*`, `/`, `%` | Same operators |
 | `**` | `pow(a, b)` |
 | `>`, `<`, `>=`, `<=`, `==`, `!=` | Same operators |
-| `math.sin`, `math.cos`, etc. | Built-in functions |
+| `sin`, `cos`, `tan`, `asin`, `acos`, `atan` | Same functions |
+| `sinh`, `cosh`, `tanh` | Same functions |
+| `sqrt`, `exp`, `exp2`, `log`, `log2` | Same functions |
+| `floor`, `ceil`, `round`, `trunc`, `fract`, `sign` | Same functions |
+| `min`, `max`, `clamp`, `mix`, `step`, `smoothstep` | Same functions |
+| `pow`, `power`, `abs` | Same functions |
 | `x if cond else y` | `select(else_val, then_val, cond)` |
+
+Supported import styles: `math.sin(x)`, `np.sin(x)`, `from math import sin`.
 
 ## Testing
 
