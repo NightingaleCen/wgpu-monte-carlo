@@ -73,6 +73,7 @@ uv run ruff format python/
 - **Naming**: `snake_case` for functions/variables, `PascalCase` for classes, `SCREAMING_SNAKE_CASE` for constants.
 - **Docstrings**: Use triple quotes with Args/Returns/Raises sections for public APIs.
 - **Error Handling**: Raise specific exceptions (`ValueError`, `TypeError`, `RuntimeError`). Custom `TranspilerError` for transpiler.
+- **Comments**: Keep comments concise and in English. Explain *what* the code does, not *why*. Focus on non-obvious parts.
 
 ### Rust Style
 
@@ -81,6 +82,7 @@ uv run ruff format python/
 - **Naming**: `snake_case` for functions/variables, `PascalCase` for types/structs/enums, `SCREAMING_SNAKE_CASE` for constants.
 - **Error Handling**: Use `anyhow::Result` for internal errors, `PyResult` for Python-facing functions. Map errors with context.
 - **Unsafe**: Minimize unsafe code; comment rationale when necessary.
+- **Comments**: Keep comments concise and in English. Explain *what* the code does, not *why*.
 
 ### General Guidelines
 
@@ -88,6 +90,7 @@ uv run ruff format python/
 - **Testing**: Write tests for new transpiler features. Integration tests require GPU.
 - **Git**: Follow conventional commits (feat:, fix:, docs:, test:, refactor:).
 - **Python Version**: Supports 3.11+. Use modern Python features (match, union types with `|`).
+- **Examples**: Keep examples minimal and focused. Demonstrate core functionality only. No verbose output or unrelated content.
 
 ## Project Structure
 
@@ -114,12 +117,14 @@ uv run ruff format python/
 The Python→WGSL transpiler supports a restricted subset:
 - Arithmetic: `+`, `-`, `*`, `/`, `%`, `**` (becomes `pow()`)
 - Comparisons: `>`, `<`, `>=`, `<=`, `==`, `!=`
-- Math functions: `sin`, `cos`, `sqrt`, `exp`, `log`, etc. (from `math` module)
+- Math functions: `sin`, `cos`, `sqrt`, `exp`, `log`, etc. (from `math` or `numpy` module)
 - Conditionals: `x if cond else y` (becomes `select()`)
 - Local variables: `var` declarations in WGSL
 - Boolean results: Auto-converted to f32 via `select(0.0, 1.0, cond)`
+- Constants: `math.pi`, `math.e`, `math.tau`, `numpy.euler_gamma`, etc.
+- External variables: Automatically captured from globals and closures
 
-**Not supported**: Loops, complex control flow, attribute access (except `math.*`), list/dict operations.
+**Not supported**: Loops, complex control flow, list/dict operations.
 
 ## Common Development Tasks
 

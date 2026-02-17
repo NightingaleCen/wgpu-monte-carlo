@@ -62,8 +62,6 @@ class TranspilerError(Exception):
 class PythonToWGSL:
     """Transpiles a restricted subset of Python math functions to WGSL."""
 
-    # TODO: Add support for numpy functions
-
     # Mapping of Python operators to WGSL operators
     OP_MAP: Dict[str, str] = {
         "Add": "+",
@@ -113,6 +111,20 @@ class PythonToWGSL:
         "power": "pow",
     }
 
+    CONSTANTS_MAP: Dict[tuple, str] = {
+        ("math", "pi"): "3.1415926535897932384626433832795",
+        ("math", "e"): "2.7182818284590452353602874713527",
+        ("math", "tau"): "6.283185307179586476925286766559",
+        ("math", "inf"): "1e300",
+        ("math", "nan"): "nan",
+        ("numpy", "pi"): "3.1415926535897932384626433832795",
+        ("numpy", "e"): "2.7182818284590452353602874713527",
+        ("numpy", "tau"): "6.283185307179586476925286766559",
+        ("numpy", "euler_gamma"): "0.577215664901532860606512090082",
+        ("numpy", "inf"): "1e300",
+        ("numpy", "nan"): "nan",
+    }
+
     KNOWN_MODULE_ALIASES: Dict[str, str] = {
         "np": "numpy",
         "numpy": "numpy",
@@ -124,6 +136,7 @@ class PythonToWGSL:
         self.local_vars: Set[str] = set()
         self.imports: Dict[str, str] = {}
         self.module_aliases: Dict[str, str] = dict(self.KNOWN_MODULE_ALIASES)
+        self.external_vars: Dict[str, float] = {}
 
     def transpile(self, func: Callable) -> str:
         """
@@ -175,10 +188,116 @@ class PythonToWGSL:
                 func_def = node
                 break
 
-        if func_def is not None:
-            return self._visit_function(func_def)
-        else:
+        if func_def is None:
             raise TranspilerError("No function definition found")
+
+        # Collect function info and capture global variables
+        params, used_names, assigned_names = self._collect_function_info(func_def)
+        self._capture_external_vars(func, params, used_names, assigned_names)
+
+        return self._visit_function(func_def)
+
+    def _collect_function_info(self, node: ast.FunctionDef) -> tuple:
+        """Collect parameter names, used names, and assigned names from a function."""
+        params = {arg.arg for arg in node.args.args}
+
+        class NameCollector(ast.NodeVisitor):
+            def __init__(self):
+                self.used: Set[str] = set()
+                self.assigned: Set[str] = set()
+
+            def visit_Name(self, n):
+                self.used.add(n.id)
+                self.generic_visit(n)
+
+            def visit_Assign(self, n):
+                for target in n.targets:
+                    if isinstance(target, ast.Name):
+                        self.assigned.add(target.id)
+                    elif isinstance(target, ast.Tuple):
+                        for elt in target.elts:
+                            if isinstance(elt, ast.Name):
+                                self.assigned.add(elt.id)
+                self.generic_visit(n)
+
+            def visit_For(self, n):
+                if isinstance(n.target, ast.Name):
+                    self.assigned.add(n.target.id)
+                self.generic_visit(n)
+
+        collector = NameCollector()
+        for stmt in node.body:
+            collector.visit(stmt)
+
+        return params, collector.used, collector.assigned
+
+    def _capture_external_vars(
+        self,
+        func: Callable,
+        params: Set[str],
+        used_names: Set[str],
+        assigned_names: Set[str],
+    ) -> None:
+        """Capture external variables from function's globals and closure."""
+        self.external_vars.clear()
+
+        # Exclude parameters, local variables, imports, and builtins
+        excluded = (
+            params
+            | assigned_names
+            | set(self.imports.keys())
+            | set(self.module_aliases.keys())
+        )
+
+        builtins = (
+            set(dir(__builtins__))
+            if isinstance(__builtins__, dict)
+            else set(dir(__builtins__))
+        )
+        excluded |= builtins
+
+        external_names = used_names - excluded
+
+        # Extract closure variables (for nested functions)
+        closure_vars = {}
+        if func.__closure__:
+            freevars = func.__code__.co_freevars
+            closure_values = [c.cell_contents for c in func.__closure__]
+            closure_vars = dict(zip(freevars, closure_values))
+
+        unknown_names = []
+        for name in external_names:
+            value = None
+
+            # Check closure first, then globals
+            if name in closure_vars:
+                value = closure_vars[name]
+            elif name in func.__globals__:
+                value = func.__globals__[name]
+
+            if value is not None:
+                # Skip callables (imported functions)
+                if callable(value):
+                    pass
+                elif isinstance(value, bool):
+                    self.external_vars[name] = 1.0 if value else 0.0
+                elif isinstance(value, (int, float)):
+                    self.external_vars[name] = float(value)
+                elif isinstance(value, type(None)):
+                    pass
+                else:
+                    raise TranspilerError(
+                        f"Unsupported external variable type for '{name}': {type(value).__name__}. "
+                        f"Only int, float, and bool are supported."
+                    )
+            else:
+                unknown_names.append(name)
+
+        if unknown_names:
+            raise TranspilerError(
+                f"Undefined variable(s): {', '.join(unknown_names)}. "
+                f"Variables must be defined in global scope, imported, or passed as parameters."
+            )
 
     def _visit_function(self, node: ast.FunctionDef) -> str:
         """Visit a function definition and generate WGSL."""
@@ -192,6 +311,11 @@ class PythonToWGSL:
         # Visit function body
         body_lines = []
         self.indent_level = 1
+
+        # Add external variable constants at the beginning
+        for var_name, var_value in self.external_vars.items():
+            body_lines.append(f"const {var_name}: f32 = {var_value};")
+
         for stmt in node.body:
             body_lines.extend(self._visit_statement(stmt))
 
@@ -239,7 +363,6 @@ class PythonToWGSL:
 
     def _transpile_lambda(self, func: Callable) -> str:
         """Transpile a lambda function, handling multiple lambdas on same line."""
-        # Cache source file to prevent reading modified files during runtime
         _ensure_source_cached(func)
 
         try:
@@ -247,31 +370,47 @@ class PythonToWGSL:
         except OSError as e:
             raise TranspilerError(f"Could not get source code: {e}")
 
-        # Calculate leading indentation before dedenting
-        # This is needed because co_positions() returns positions in the original file
+        # Calculate leading indentation for position adjustment
         leading_spaces = len(source) - len(source.lstrip())
-
-        # Remove leading indentation
         source = textwrap.dedent(source)
 
+        # Try to parse the source directly
+        tree = None
         try:
             tree = ast.parse(source)
-        except SyntaxError as e:
-            raise TranspilerError(f"Invalid Python syntax: {e}")
+        except SyntaxError:
+            # If parsing fails, the source might be a fragment
+            # This happens when lambdas are passed as function arguments
+            tree = self._try_parse_lambda_fragment(source)
+
+        if tree is None:
+            raise TranspilerError(
+                "Could not parse lambda source. "
+                "This may happen when lambdas are passed directly in function calls. "
+                "Consider assigning the lambda to a variable first."
+            )
 
         self._analyze_imports(tree)
 
-        # Find all lambda nodes
+        source_file = inspect.getsourcefile(func)
+        if source_file:
+            try:
+                with open(source_file, "r") as f:
+                    full_source = f.read()
+                full_tree = ast.parse(full_source)
+                self._analyze_file_imports(full_tree)
+            except (OSError, SyntaxError):
+                pass
+
         lambdas = [node for node in ast.walk(tree) if isinstance(node, ast.Lambda)]
 
         if len(lambdas) == 0:
             raise TranspilerError("No lambda definition found")
 
         if len(lambdas) == 1:
-            # Single lambda - transpile it directly
-            return self._visit_lambda(lambdas[0])
+            return self._visit_lambda(lambdas[0], func)
 
-        # Multiple lambdas on same line - need to match using code positions (Python 3.11+)
+        # Multiple lambdas on same line - match using code positions (Python 3.11+)
         if not _PYTHON_SUPPORTS_LAMBDA_POSITIONS:
             raise TranspilerError(
                 "Multiple lambdas on the same line detected. "
@@ -279,14 +418,11 @@ class PythonToWGSL:
                 "Please define each lambda on a separate line or upgrade to Python 3.11+."
             )
 
-        # Use co_positions to find the correct lambda
-        # The lambda's body position in co_positions should match the AST body's position
         target_positions = list(func.__code__.co_positions())
         if not target_positions:
             raise TranspilerError("Could not get code positions for lambda")
 
-        # Get the first meaningful position (usually the second one, as first is often 0)
-        # This gives us the column where the lambda body starts
+        # Find the column where the lambda body starts
         target_col = None
         for pos in target_positions:
             if pos[2] is not None and pos[2] > 0:
@@ -296,43 +432,106 @@ class PythonToWGSL:
         if target_col is None:
             raise TranspilerError("Could not determine lambda position")
 
-        # Adjust target_col to account for dedentation
-        # co_positions() gives positions in the original file (with indentation)
-        # AST gives positions in the dedented source
+        # Adjust for dedentation
         target_col_adjusted = target_col - leading_spaces
 
-        # Match by comparing the body column positions
-        # target_col is from code positions (where the body expression starts)
-        # AST lambda body also has col_offset (where the body expression starts in source)
         def get_body_start_col(lam):
             """Get the column where the lambda body starts."""
             body = lam.body
             if hasattr(body, "col_offset") and body.col_offset is not None:
                 return body.col_offset
-            # Fallback: dynamically calculate offset from lambda to body
-            # This handles variable-length parameter names correctly
-            # In practice, body.col_offset is always available in Python 3.8+
             raise TranspilerError(
                 "Lambda body position information not available. "
                 "Please upgrade to Python 3.8+ for lambda transpilation support."
             )
 
+        # Match lambda by comparing body column positions
         best_match = min(
             lambdas, key=lambda lam: abs(get_body_start_col(lam) - target_col_adjusted)
         )
 
-        return self._visit_lambda(best_match)
+        return self._visit_lambda(best_match, func)
 
-    def _visit_lambda(self, node: ast.Lambda) -> str:
+    def _try_parse_lambda_fragment(self, source: str) -> ast.AST | None:
+        """Try to parse a lambda fragment that may be incomplete.
+
+        This handles cases where inspect.getsource returns a fragment like:
+        '[lambda x: x, lambda x: x**2], other_args, kwarg=val'
+        """
+        stripped = source.strip()
+
+        # Case 1: List starting with '[' - extract until matching ']'
+        if stripped.startswith("["):
+            depth = 0
+            for i, c in enumerate(stripped):
+                if c == "[":
+                    depth += 1
+                elif c == "]":
+                    depth -= 1
+                    if depth == 0:
+                        list_part = stripped[: i + 1]
+                        try:
+                            return ast.parse(list_part)
+                        except SyntaxError:
+                            break
+
+        # Case 2: Tuple starting with '(' - extract until matching ')'
+        if stripped.startswith("("):
+            depth = 0
+            for i, c in enumerate(stripped):
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        tuple_part = stripped[: i + 1]
+                        try:
+                            return ast.parse(tuple_part)
+                        except SyntaxError:
+                            break
+
+        # Case 3: Try wrapping in an assignment
+        try:
+            return ast.parse(f"__wrapper__ = {stripped}")
+        except SyntaxError:
+            pass
+
+        return None
+
+    def _collect_lambda_info(self, node: ast.Lambda) -> tuple:
+        """Collect parameter names and used names from a lambda."""
+        params = {arg.arg for arg in node.args.args}
+
+        class NameCollector(ast.NodeVisitor):
+            def __init__(self):
+                self.used: Set[str] = set()
+
+            def visit_Name(self, n):
+                self.used.add(n.id)
+
+        collector = NameCollector()
+        collector.visit(node.body)
+
+        return params, collector.used, set()
+
+    def _visit_lambda(self, node: ast.Lambda, func: Callable) -> str:
         """Visit a lambda expression and generate WGSL."""
-        # Lambda doesn't have a name, generate one
         import uuid
 
+        # Lambda doesn't have a name, generate one
         name = f"user_func_{uuid.uuid4().hex[:8]}"
         params = [arg.arg for arg in node.args.args]
 
-        # Build parameter list with types (all f32 for now)
+        # Collect external variables
+        param_set, used_names, assigned_names = self._collect_lambda_info(node)
+        self._capture_external_vars(func, param_set, used_names, assigned_names)
+
+        # Build parameter list with types (all f32)
         param_list = ", ".join(f"{p}: f32" for p in params)
+
+        body_lines = []
+        for var_name, var_value in self.external_vars.items():
+            body_lines.append(f"const {var_name}: f32 = {var_value};")
 
         # Lambda body is a single expression
         body_expr = self._visit_expression(node.body)
@@ -341,7 +540,11 @@ class PythonToWGSL:
         if self._is_boolean_expression(node.body):
             body_expr = f"select(0.0, 1.0, {body_expr})"
 
-        return f"fn {name}({param_list}) -> f32 {{\n    return {body_expr};\n}}"
+        body_lines.append(f"return {body_expr};")
+
+        body_str = "\n    ".join(body_lines)
+
+        return f"fn {name}({param_list}) -> f32 {{\n    {body_str}\n}}"
 
     def _is_boolean_expression(self, node: ast.AST) -> bool:
         """Check if an expression returns a boolean value."""
@@ -436,7 +639,7 @@ class PythonToWGSL:
     def _visit_expression(self, node: ast.AST) -> str:
         """Visit an expression and return WGSL code."""
         if isinstance(node, ast.Name):
-            return node.id
+            return self._visit_name(node)
         elif isinstance(node, ast.Constant):
             if isinstance(node.value, bool):
                 return "true" if node.value else "false"
@@ -444,8 +647,8 @@ class PythonToWGSL:
                 return str(float(node.value))
             else:
                 raise TranspilerError(f"Unsupported constant type: {type(node.value)}")
-        elif isinstance(node, ast.Num):  # Python < 3.8 compatibility
-            return str(float(node.n))
+        elif isinstance(node, ast.Constant):
+            return str(float(node.value))
         elif isinstance(node, ast.BinOp):
             return self._visit_binop(node)
         elif isinstance(node, ast.UnaryOp):
@@ -456,8 +659,50 @@ class PythonToWGSL:
             return self._visit_conditional(node)
         elif isinstance(node, ast.Compare):
             return self._visit_compare(node)
+        elif isinstance(node, ast.Attribute):
+            return self._visit_attribute(node)
         else:
             raise TranspilerError(f"Unsupported expression type: {type(node).__name__}")
+
+    def _visit_name(self, node: ast.Name) -> str:
+        """Visit a Name node, checking for imported constants."""
+        name = node.id
+        if name in self.imports:
+            full_name = self.imports[name]
+            parts = full_name.split(".")
+            if len(parts) == 2:
+                module, const = parts
+                if (module, const) in self.CONSTANTS_MAP:
+                    return self.CONSTANTS_MAP[(module, const)]
+        return name
+
+    def _visit_attribute(self, node: ast.Attribute) -> str:
+        """Visit an Attribute node (e.g., math.pi, np.e)."""
+        if isinstance(node.value, ast.Name):
+            module_alias = node.value.id
+            const_name = node.attr
+            if module_alias in self.module_aliases:
+                module_name = self.module_aliases[module_alias]
+                key = (module_name, const_name)
+                if key in self.CONSTANTS_MAP:
+                    return self.CONSTANTS_MAP[key]
+                else:
+                    raise TranspilerError(
+                        f"Unknown constant: {module_alias}.{const_name}. "
+                        f"Available constants: {', '.join(f'{m}.{c}' for m, c in self.CONSTANTS_MAP.keys())}"
+                    )
+            elif module_alias in self.imports:
+                full_import = self.imports[module_alias]
+                module_name = full_import.split(".")[-1]
+                key = (module_name, const_name)
+                if key in self.CONSTANTS_MAP:
+                    return self.CONSTANTS_MAP[key]
+            else:
+                raise TranspilerError(
+                    f"Unsupported module: {module_alias}. "
+                    f"Supported modules: {', '.join(sorted(set(self.module_aliases.values()) | set(k.split('.')[0] for k in self.imports.values())))}"
+                )
+        raise TranspilerError(f"Unsupported attribute access: {node.attr}")
 
     def _visit_binop(self, node: ast.BinOp) -> str:
         """Visit a binary operation."""
