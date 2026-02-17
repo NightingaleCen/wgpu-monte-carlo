@@ -4,66 +4,12 @@
 //! All distributions generate samples on the GPU from uniform random numbers.
 
 /// Distribution types supported by the integrator
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DistributionType {
     Uniform,
     Normal,
     Exponential,
-    Table, // Lookup table-based sampling
-}
-
-/// Parameters for probability distributions
-#[derive(Debug, Clone)]
-pub struct DistributionParams {
-    pub dist_type: DistributionType,
-    pub param1: f32,     // min/mean/lambda
-    pub param2: f32,     // max/std/unused
-    pub table_size: u32, // For table-based distributions
-}
-
-impl DistributionParams {
-    /// Create uniform distribution U(min, max)
-    pub fn uniform(min: f32, max: f32) -> Self {
-        Self {
-            dist_type: DistributionType::Uniform,
-            param1: min,
-            param2: max,
-            table_size: 0,
-        }
-    }
-
-    /// Create normal distribution N(mean, std)
-    pub fn normal(mean: f32, std: f32) -> Self {
-        Self {
-            dist_type: DistributionType::Normal,
-            param1: mean,
-            param2: std,
-            table_size: 0,
-        }
-    }
-
-    /// Create exponential distribution Exp(lambda)
-    pub fn exponential(lambda: f32) -> Self {
-        Self {
-            dist_type: DistributionType::Exponential,
-            param1: lambda,
-            param2: 0.0,
-            table_size: 0,
-        }
-    }
-
-    /// Create table-based distribution
-    ///
-    /// TODO: Currently uses 2048 elements. Consider increasing to 4096 or 8192
-    /// for higher precision in future versions.
-    pub fn from_table(table_size: u32) -> Self {
-        Self {
-            dist_type: DistributionType::Table,
-            param1: 0.0,
-            param2: 0.0,
-            table_size,
-        }
-    }
+    Table,
 }
 
 /// Generate the WGSL distribution library code
@@ -155,41 +101,25 @@ fn sample_from_table(rng: f32, table_size: u32) -> f32 {
 }
 
 /// Generate WGSL code for sampling from a specific distribution
-pub fn generate_sample_code(dist_params: &DistributionParams) -> String {
-    match dist_params.dist_type {
+pub fn generate_sample_code(dist_type: DistributionType) -> String {
+    match dist_type {
         DistributionType::Uniform => {
-            format!("sample_uniform(rng, dist_params.param1, dist_params.param2)",)
+            "sample_uniform(rng, dist_params.param1, dist_params.param2)".to_string()
         }
         DistributionType::Normal => {
-            format!(
-                "sample_normal_box_muller(params.seed, idx, i, dist_params.param1, dist_params.param2)",
-            )
+            "sample_normal_box_muller(params.seed, idx, i, dist_params.param1, dist_params.param2)"
+                .to_string()
         }
-        DistributionType::Exponential => {
-            format!("sample_exponential(rng, dist_params.param1)",)
-        }
-        DistributionType::Table => {
-            // Inline table sampling code - WGSL doesn't allow passing storage pointers as function arguments
-            // This generates multiple let declarations followed by the final expression
-            // It will be used directly in the shader template without extra braces
-            r#"sample_from_table(rng, dist_params.table_size)"#.to_string()
-        }
+        DistributionType::Exponential => "sample_exponential(rng, dist_params.param1)".to_string(),
+        DistributionType::Table => "sample_from_table(rng, dist_params.table_size)".to_string(),
     }
 }
 
 /// Generate WGSL code for RNG generation based on distribution type
-pub fn generate_rng_code(dist_params: &DistributionParams) -> String {
-    // For most distributions, we need a single uniform random number
-    // For Normal (Box-Muller), the sample function handles its own RNG
-    match dist_params.dist_type {
-        DistributionType::Normal => {
-            // Box-Muller handles RNG internally
-            "".to_string()
-        }
-        _ => {
-            // Standard uniform RNG
-            "let rng = random_uniform(params.seed, idx, i);".to_string()
-        }
+pub fn generate_rng_code(dist_type: DistributionType) -> String {
+    match dist_type {
+        DistributionType::Normal => "".to_string(),
+        _ => "let rng = random_uniform(params.seed, idx, i);".to_string(),
     }
 }
 
@@ -208,41 +138,67 @@ mod tests {
     }
 
     #[test]
-    fn test_table_sample_code() {
-        let table = DistributionParams::from_table(2048);
-        let code = generate_sample_code(&table);
+    fn test_distribution_type_variants() {
+        let _ = DistributionType::Uniform;
+        let _ = DistributionType::Normal;
+        let _ = DistributionType::Exponential;
+        let _ = DistributionType::Table;
+    }
+
+    #[test]
+    fn test_distribution_type_debug() {
+        let uniform = format!("{:?}", DistributionType::Uniform);
+        assert!(uniform.contains("Uniform"));
+
+        let normal = format!("{:?}", DistributionType::Normal);
+        assert!(normal.contains("Normal"));
+    }
+
+    #[test]
+    fn test_distribution_type_partial_eq() {
+        assert_eq!(DistributionType::Uniform, DistributionType::Uniform);
+        assert_ne!(DistributionType::Uniform, DistributionType::Normal);
+    }
+
+    #[test]
+    fn test_sample_code_uniform() {
+        let code = generate_sample_code(DistributionType::Uniform);
+        assert!(code.contains("sample_uniform"));
+    }
+
+    #[test]
+    fn test_sample_code_normal() {
+        let code = generate_sample_code(DistributionType::Normal);
+        assert!(code.contains("sample_normal_box_muller"));
+    }
+
+    #[test]
+    fn test_sample_code_exponential() {
+        let code = generate_sample_code(DistributionType::Exponential);
+        assert!(code.contains("sample_exponential"));
+    }
+
+    #[test]
+    fn test_sample_code_table() {
+        let code = generate_sample_code(DistributionType::Table);
         assert!(code.contains("sample_from_table"));
     }
 
     #[test]
-    fn test_distribution_params() {
-        let uniform = DistributionParams::uniform(0.0, 1.0);
-        assert!(matches!(uniform.dist_type, DistributionType::Uniform));
-        assert_eq!(uniform.param1, 0.0);
-        assert_eq!(uniform.param2, 1.0);
-
-        let normal = DistributionParams::normal(0.0, 1.0);
-        assert!(matches!(normal.dist_type, DistributionType::Normal));
-        assert_eq!(normal.param1, 0.0);
-        assert_eq!(normal.param2, 1.0);
-
-        let exp = DistributionParams::exponential(2.0);
-        assert!(matches!(exp.dist_type, DistributionType::Exponential));
-        assert_eq!(exp.param1, 2.0);
+    fn test_rng_code_normal() {
+        let code = generate_rng_code(DistributionType::Normal);
+        assert!(code.is_empty());
     }
 
     #[test]
-    fn test_sample_code_generation() {
-        let uniform = DistributionParams::uniform(0.0, 1.0);
-        let code = generate_sample_code(&uniform);
-        assert!(code.contains("sample_uniform"));
+    fn test_rng_code_other() {
+        let code = generate_rng_code(DistributionType::Uniform);
+        assert!(code.contains("random_uniform"));
 
-        let normal = DistributionParams::normal(0.0, 1.0);
-        let code = generate_sample_code(&normal);
-        assert!(code.contains("sample_normal_box_muller"));
+        let code = generate_rng_code(DistributionType::Exponential);
+        assert!(code.contains("random_uniform"));
 
-        let exp = DistributionParams::exponential(1.0);
-        let code = generate_sample_code(&exp);
-        assert!(code.contains("sample_exponential"));
+        let code = generate_rng_code(DistributionType::Table);
+        assert!(code.contains("random_uniform"));
     }
 }

@@ -5,7 +5,7 @@ mod distribution;
 mod engine;
 mod shader_gen;
 
-use distribution::DistributionParams;
+use distribution::DistributionType;
 use engine::{ComputeEngine, DistributionParamsBuffer};
 use shader_gen::generate_compute_shader;
 use shader_gen::{generate_integration_shader, IntegrationShaderConfig};
@@ -125,6 +125,7 @@ impl MonteCarloIntegrator {
     ///
     /// Returns:
     ///     Vec<f32> of expected values (one per function)
+    #[pyo3(signature = (functions, dist_type, dist_params, n_samples, seed, lookup_table=None, target_threads=None))]
     fn integrate<'py>(
         &mut self,
         py: Python<'py>,
@@ -172,7 +173,7 @@ impl MonteCarloIntegrator {
         // Create shader config
         let shader_config = IntegrationShaderConfig {
             user_functions: functions,
-            dist_params: Self::convert_dist_params(&dist_params_buffer),
+            dist_type: Self::convert_dist_type(&dist_params_buffer),
             workgroup_size: config.workgroup_size,
         };
 
@@ -285,23 +286,14 @@ impl MonteCarloIntegrator {
         }
     }
 
-    /// Convert to DistributionParams for shader generation
-    fn convert_dist_params(buffer: &DistributionParamsBuffer) -> DistributionParams {
-        use distribution::DistributionType;
-
-        let dist_type = match buffer.dist_type {
+    /// Convert to DistributionType for shader generation
+    fn convert_dist_type(buffer: &DistributionParamsBuffer) -> DistributionType {
+        match buffer.dist_type {
             0 => DistributionType::Uniform,
             1 => DistributionType::Normal,
             2 => DistributionType::Exponential,
             3 => DistributionType::Table,
             _ => DistributionType::Uniform,
-        };
-
-        DistributionParams {
-            dist_type,
-            param1: buffer.param1,
-            param2: buffer.param2,
-            table_size: buffer.table_size,
         }
     }
 }

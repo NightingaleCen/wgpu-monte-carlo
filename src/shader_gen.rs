@@ -4,13 +4,13 @@
 //! on the same random samples in a single GPU pass.
 
 use crate::distribution::{
-    generate_distribution_library, generate_rng_code, generate_sample_code, DistributionParams,
+    generate_distribution_library, generate_rng_code, generate_sample_code, DistributionType,
 };
 
 /// Configuration for integration shader generation
 pub struct IntegrationShaderConfig {
-    pub user_functions: Vec<String>, // List of WGSL function bodies
-    pub dist_params: DistributionParams,
+    pub user_functions: Vec<String>,
+    pub dist_type: DistributionType,
     pub workgroup_size: u32,
 }
 
@@ -31,8 +31,8 @@ pub fn generate_integration_shader(
     let dist_lib = generate_distribution_library();
     let user_funcs_code = generate_user_functions(&config.user_functions);
     let accumulator_init = generate_accumulator_init(k);
-    let sample_code = generate_sample_code(&config.dist_params);
-    let rng_code = generate_rng_code(&config.dist_params);
+    let sample_code = generate_sample_code(config.dist_type);
+    let rng_code = generate_rng_code(config.dist_type);
     let accumulation_code = generate_accumulation_code(k);
     let output_write_code = generate_output_write(k);
 
@@ -178,14 +178,14 @@ fn generate_output_write(k: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::DistributionParams;
+    use crate::distribution::DistributionType;
 
     #[test]
     fn test_single_function_shader() {
         let func = "fn compute(x: f32) -> f32 {\n    return x * x;\n}".to_string();
         let config = IntegrationShaderConfig {
             user_functions: vec![func],
-            dist_params: DistributionParams::uniform(0.0, 1.0),
+            dist_type: DistributionType::Uniform,
             workgroup_size: 256,
         };
 
@@ -206,28 +206,24 @@ mod tests {
         ];
         let config = IntegrationShaderConfig {
             user_functions: funcs,
-            dist_params: DistributionParams::normal(0.0, 1.0),
+            dist_type: DistributionType::Normal,
             workgroup_size: 256,
         };
 
         let shader = generate_integration_shader(&config, 100);
 
-        // Check all three functions are present
         assert!(shader.contains("user_func_0"));
         assert!(shader.contains("user_func_1"));
         assert!(shader.contains("user_func_2"));
 
-        // Check all accumulators are present
         assert!(shader.contains("var acc_0 = 0.0"));
         assert!(shader.contains("var acc_1 = 0.0"));
         assert!(shader.contains("var acc_2 = 0.0"));
 
-        // Check all accumulations
         assert!(shader.contains("acc_0 += f32(user_func_0(sample))"));
         assert!(shader.contains("acc_1 += f32(user_func_1(sample))"));
         assert!(shader.contains("acc_2 += f32(user_func_2(sample))"));
 
-        // Check output writes
         assert!(shader.contains("base_idx + 0u"));
         assert!(shader.contains("base_idx + 1u"));
         assert!(shader.contains("base_idx + 2u"));
@@ -250,6 +246,55 @@ mod tests {
         assert!(init_3.contains("var acc_0 = 0.0;"));
         assert!(init_3.contains("var acc_1 = 0.0;"));
         assert!(init_3.contains("var acc_2 = 0.0;"));
+    }
+
+    #[test]
+    fn test_shader_uniform_sampling_in_output() {
+        let config = IntegrationShaderConfig {
+            user_functions: vec!["fn f(x: f32) -> f32 { return x; }".to_string()],
+            dist_type: DistributionType::Uniform,
+            workgroup_size: 256,
+        };
+
+        let shader = generate_integration_shader(&config, 100);
+        assert!(shader.contains("sample_uniform"));
+    }
+
+    #[test]
+    fn test_shader_normal_sampling_in_output() {
+        let config = IntegrationShaderConfig {
+            user_functions: vec!["fn f(x: f32) -> f32 { return x; }".to_string()],
+            dist_type: DistributionType::Normal,
+            workgroup_size: 256,
+        };
+
+        let shader = generate_integration_shader(&config, 100);
+        assert!(shader.contains("sample_normal_box_muller"));
+    }
+
+    #[test]
+    fn test_shader_exponential_sampling_in_output() {
+        let config = IntegrationShaderConfig {
+            user_functions: vec!["fn f(x: f32) -> f32 { return x; }".to_string()],
+            dist_type: DistributionType::Exponential,
+            workgroup_size: 256,
+        };
+
+        let shader = generate_integration_shader(&config, 100);
+        assert!(shader.contains("sample_exponential"));
+    }
+
+    #[test]
+    fn test_shader_table_sampling_in_output() {
+        let config = IntegrationShaderConfig {
+            user_functions: vec!["fn f(x: f32) -> f32 { return x; }".to_string()],
+            dist_type: DistributionType::Table,
+            workgroup_size: 256,
+        };
+
+        let shader = generate_integration_shader(&config, 100);
+        assert!(shader.contains("sample_from_table"));
+        assert!(shader.contains("lookup_table"));
     }
 }
 
