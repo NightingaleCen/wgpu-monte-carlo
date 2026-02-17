@@ -6,10 +6,10 @@ use wgpu::{Buffer, Device, Queue};
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct SimulationParams {
-    pub n: u32,           // Array length
-    pub iterations: u32,  // Number of iterations
-    pub seed: u32,        // RNG seed
-    pub _padding: u32,    // Ensure 16-byte alignment
+    pub n: u32,          // Array length
+    pub iterations: u32, // Number of iterations
+    pub seed: u32,       // RNG seed
+    pub _padding: u32,   // Ensure 16-byte alignment
 }
 
 /// Parameters for Monte Carlo integration
@@ -27,10 +27,10 @@ pub struct IntegrationParams {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct DistributionParamsBuffer {
-    pub param1: f32,      // min/mean/lambda
-    pub param2: f32,      // max/std/unused
-    pub dist_type: u32,   // 0=uniform, 1=normal, 2=exponential, 3=table
-    pub table_size: u32,  // For table-based distributions
+    pub param1: f32,     // min/mean/lambda
+    pub param2: f32,     // max/std/unused
+    pub dist_type: u32,  // 0=uniform, 1=normal, 2=exponential, 3=table
+    pub table_size: u32, // For table-based distributions
 }
 
 /// Dispatch configuration for smart workload partitioning
@@ -164,67 +164,78 @@ impl ComputeEngine {
     }
 
     pub fn create_compute_pipeline(&mut self, shader_code: &str) -> Result<()> {
-        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-        });
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_code.into()),
+            });
 
-        let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Bind Group Layout"),
-            entries: &[
-                // Params (uniform)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Input buffer (read-only storage)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Output buffer (read-write storage)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Bind Group Layout"),
+                    entries: &[
+                        // Params (uniform)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Input buffer (read-only storage)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // Output buffer (read-write storage)
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
 
-        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Pipeline Layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
-        self.compute_pipeline = Some(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader_module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        }));
+        self.compute_pipeline = Some(self.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+        ));
 
         // Create bind group (only if buffers exist)
-        if self.params_buffer.is_some() && self.input_buffer.is_some() && self.output_buffer.is_some() {
+        if self.params_buffer.is_some()
+            && self.input_buffer.is_some()
+            && self.output_buffer.is_some()
+        {
             self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Bind Group"),
                 layout: &bind_group_layout,
@@ -249,7 +260,10 @@ impl ComputeEngine {
     }
 
     pub fn execute(&mut self) -> Result<Vec<f32>> {
-        let pipeline = self.compute_pipeline.as_ref().context("Pipeline not created")?;
+        let pipeline = self
+            .compute_pipeline
+            .as_ref()
+            .context("Pipeline not created")?;
         let bind_group = self.bind_group.as_ref().context("Bind group not created")?;
         let n = self
             .input_buffer
@@ -257,9 +271,11 @@ impl ComputeEngine {
             .map(|b| b.size() as u32 / 4)
             .context("Input buffer not initialized")?;
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Compute Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Compute Encoder"),
+            });
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -322,26 +338,31 @@ impl ComputeEngine {
     // ========================================
 
     /// Calculate optimal dispatch configuration for Monte Carlo integration
-    /// 
+    ///
     /// Given a total number of samples, this calculates:
     /// - How many threads to launch (target ~65k to saturate GPU)
     /// - How many samples each thread should process
     /// - Workgroup count and size
-    /// 
+    ///
     /// Exposed as tunable parameter for advanced users
-    pub fn calculate_dispatch_config(&self, n_samples: u64, target_threads: Option<u32>) -> DispatchConfig {
+    pub fn calculate_dispatch_config(
+        &self,
+        n_samples: u64,
+        target_threads: Option<u32>,
+    ) -> DispatchConfig {
         // Default to ~65k threads to saturate GPU without hitting limits
         // Users can override this via target_threads parameter
         let target = target_threads.unwrap_or(65536);
-        let workgroup_size: u32 = 256;  // Common optimal size
-        
+        let workgroup_size: u32 = 256; // Common optimal size
+
         let workgroup_count = (target + workgroup_size - 1) / workgroup_size;
         let total_threads = workgroup_count * workgroup_size;
-        
+
         // Calculate how many samples each thread should process
         // Ceiling division to ensure we get at least n_samples total
-        let loops_per_thread = ((n_samples + total_threads as u64 - 1) / total_threads as u64) as u32;
-        
+        let loops_per_thread =
+            ((n_samples + total_threads as u64 - 1) / total_threads as u64) as u32;
+
         DispatchConfig {
             workgroup_size,
             workgroup_count,
@@ -351,7 +372,7 @@ impl ComputeEngine {
     }
 
     /// Setup integration buffers and parameters
-    /// 
+    ///
     /// This creates the necessary GPU buffers for Monte Carlo integration.
     /// Unlike simulation mode, there's no input buffer (samples generated on GPU).
     pub fn setup_integration(
@@ -364,7 +385,7 @@ impl ComputeEngine {
         target_threads: Option<u32>,
     ) -> Result<DispatchConfig> {
         let config = self.calculate_dispatch_config(n_samples, target_threads);
-        
+
         // Create integration params uniform buffer
         let integration_params = IntegrationParams {
             n_threads: config.total_threads,
@@ -424,7 +445,7 @@ impl ComputeEngine {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
-            
+
             self.queue.write_buffer(
                 self.lookup_table_buffer.as_ref().unwrap(),
                 0,
@@ -433,7 +454,8 @@ impl ComputeEngine {
         }
 
         // Output buffer: size = total_threads * k_functions (flattened layout)
-        let output_size = (config.total_threads as usize * k_functions * std::mem::size_of::<f32>()) as u64;
+        let output_size =
+            (config.total_threads as usize * k_functions * std::mem::size_of::<f32>()) as u64;
         self.output_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Integration Output Buffer"),
             size: output_size,
@@ -453,17 +475,19 @@ impl ComputeEngine {
     }
 
     /// Create compute pipeline for integration mode
-    /// 
+    ///
     /// This sets up the bind group layout with 4 bindings:
     /// - binding 0: IntegrationParams (uniform)
     /// - binding 1: DistributionParams (uniform)
     /// - binding 2: Lookup table (storage, optional)
     /// - binding 3: Output buffer (storage)
     pub fn create_integration_pipeline(&mut self, shader_code: &str) -> Result<()> {
-        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Integration Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-        });
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Integration Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_code.into()),
+            });
 
         // Bind group layout for integration mode
         let entries = vec![
@@ -513,25 +537,31 @@ impl ComputeEngine {
             },
         ];
 
-        let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Integration Bind Group Layout"),
-            entries: &entries,
-        });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Integration Bind Group Layout"),
+                    entries: &entries,
+                });
 
-        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Integration Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Integration Pipeline Layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
-        self.compute_pipeline = Some(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Integration Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader_module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        }));
+        self.compute_pipeline = Some(self.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("Integration Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+        ));
 
         // Create bind group
         let mut bind_entries = vec![
@@ -541,14 +571,22 @@ impl ComputeEngine {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: self.dist_params_buffer.as_ref().unwrap().as_entire_binding(),
+                resource: self
+                    .dist_params_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
             },
         ];
 
         // Add lookup table binding (always present - dummy for non-table distributions)
         bind_entries.push(wgpu::BindGroupEntry {
             binding: 2,
-            resource: self.lookup_table_buffer.as_ref().unwrap().as_entire_binding(),
+            resource: self
+                .lookup_table_buffer
+                .as_ref()
+                .unwrap()
+                .as_entire_binding(),
         });
 
         bind_entries.push(wgpu::BindGroupEntry {
@@ -566,16 +604,21 @@ impl ComputeEngine {
     }
 
     /// Execute integration and return thread results
-    /// 
+    ///
     /// Returns raw thread results. CPU-based reduction to final expected values
     /// should be done by the caller.
     pub fn execute_integration(&mut self, workgroup_count: u32) -> Result<Vec<f32>> {
-        let pipeline = self.compute_pipeline.as_ref().context("Pipeline not created")?;
+        let pipeline = self
+            .compute_pipeline
+            .as_ref()
+            .context("Pipeline not created")?;
         let bind_group = self.bind_group.as_ref().context("Bind group not created")?;
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Integration Compute Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Integration Compute Encoder"),
+            });
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
