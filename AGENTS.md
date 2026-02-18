@@ -32,7 +32,7 @@ uv run pytest tests/ -v
 # Run single test file
 uv run pytest tests/test_transpiler.py -v
 uv run pytest tests/test_integration.py -v
-uv run pytest tests/test_beta_distribution.py -v
+uv run pytest tests/test_distributions.py -v
 
 # Run specific test class
 uv run pytest tests/test_transpiler.py::TestTranspiler -v
@@ -45,6 +45,59 @@ uv run pytest tests/test_integration.py -v
 
 # Run transpiler tests only (no GPU required)
 uv run pytest tests/test_transpiler.py -v
+```
+
+## Testing Guidelines
+
+### Philosophy
+
+**Tests exist to find problems, not to simply pass.** When a test fails, it often reveals a real issue that needs to be fixed in the implementation, not in the test itself.
+
+### Writing Tests
+
+- **Test the real behavior**: Tests should verify actual functionality, not just exercise code paths.
+- **Cover edge cases**: Consider boundary conditions, invalid inputs, and unusual but valid use cases.
+- **Use meaningful assertions**: Verify specific values, not just that "nothing crashed."
+- **Name tests descriptively**: Test names should describe what is being tested and expected behavior.
+
+### When Tests Fail
+
+1. **Do NOT modify tests to make them pass** if the test is checking correct behavior.
+2. **DO fix the implementation** if the test reveals a real bug.
+3. **DO update tests** only if:
+   - The original test was checking incorrect behavior
+   - The API has intentionally changed
+4. **Document known limitations** in test docstrings if certain edge cases cannot be handled.
+
+### Test Categories
+
+| Category | Description | GPU Required |
+|----------|-------------|--------------|
+| Unit Tests | Test individual functions/modules | No |
+| Integration Tests | Test end-to-end functionality | Yes |
+| Transpiler Tests | Test Python→WGSL conversion | No |
+| Distribution Tests | Test probability distributions | Yes |
+
+### Distribution Tests
+
+When adding tests for `Distribution.from_pdf()`:
+- Test automatic support detection for bounded distributions (e.g., Beta in (0,1))
+- Test support detection for shifted distributions (e.g., N(100, 1))
+- Test edge cases: PDF returns NaN, inf, negative values
+- Test that user-specified `support` parameter works correctly
+- Test numerical accuracy with different `table_size` values
+
+Example:
+```python
+def test_bounded_support_auto_detection(self):
+    """Test that bounded distribution (0, 1) is auto-detected without support param."""
+    # PDF only non-zero in (0, 1)
+    def pdf(x):
+        return 6.0 * x * (1.0 - x) if 0 < x < 1 else 0.0
+
+    # Should auto-detect without manual support
+    dist = Distribution.from_pdf(pdf)
+    assert dist is not None
 ```
 
 ## Lint/Format Commands
@@ -87,7 +140,7 @@ uv run ruff format python/
 ### General Guidelines
 
 - **Documentation**: Docstrings for all public Python APIs; `///` comments for public Rust items.
-- **Testing**: Write tests for new transpiler features. Integration tests require GPU.
+- **Testing**: Write tests for new features. Tests should verify actual behavior, not just pass. Integration tests require GPU.
 - **Git**: Follow conventional commits (feat:, fix:, docs:, test:, refactor:).
 - **Python Version**: Supports 3.11+. Use modern Python features (match, union types with `|`).
 - **Examples**: Keep examples minimal and focused. Demonstrate core functionality only. No verbose output or unrelated content.
@@ -98,7 +151,7 @@ uv run ruff format python/
 ├── src/                     # Rust source code
 │   ├── lib.rs              # PyO3 bindings, main module
 │   ├── engine.rs           # wgpu compute engine
-│   ├── distribution.rs     # WGSL distribution library
+│   ├── distribution.rs      # WGSL distribution library
 │   └── shader_gen.rs       # Shader code generation
 ├── python/wgpu_montecarlo/ # Python package
 │   ├── __init__.py         # Public API (Integrator, Distribution, Simulator)
@@ -106,7 +159,7 @@ uv run ruff format python/
 ├── tests/                   # Test suite
 │   ├── test_transpiler.py  # Transpiler unit tests (no GPU)
 │   ├── test_integration.py # GPU integration tests
-│   └── test_beta_distribution.py  # Distribution-specific tests
+│   └── test_distributions.py  # Distribution tests (both analytical and custom)
 ├── examples/               # Example scripts
 ├── pyproject.toml          # Python package config, tool settings
 └── Cargo.toml             # Rust package config
