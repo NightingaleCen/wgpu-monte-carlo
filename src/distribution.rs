@@ -9,7 +9,7 @@ pub enum DistributionType {
     Uniform,
     Normal,
     Exponential,
-    Table,
+    Custom,
 }
 
 /// Generate the WGSL distribution library code
@@ -83,18 +83,38 @@ fn sample_exponential(rng: f32, lambda: f32) -> f32 {
     return -log(u) / lambda;
 }
 
-// Table-based sampling using inverse CDF lookup table
-// Uses linear interpolation for smooth results
-fn sample_from_table(rng: f32, table_size: u32) -> f32 {
-    let scaled = rng * f32(table_size - 1u);
-    let idx_low = u32(floor(scaled));
-    let idx_high = min(idx_low + 1u, table_size - 1u);
-    let frac = fract(scaled);
+// Custom distribution sampling using CDF lookup table
+// Uses binary search and linear interpolation
+fn sample_from_cdf_table(rng: f32, table_size: u32) -> f32 {
+    // Binary search for rng in cdf_table
+    var low = 0u;
+    var high = table_size - 1u;
     
-    // Linear interpolation between table entries
-    let val_low = lookup_table[idx_low];
-    let val_high = lookup_table[idx_high];
-    return val_low + frac * (val_high - val_low);
+    for (var j = 0u; j < 12u; j++) {
+        if (low >= high) { break; }
+        let mid = (low + high) / 2u;
+        if (lookup_table[mid] < rng) {
+            low = mid + 1u;
+        } else {
+            high = mid;
+        }
+    }
+    
+    // Linear interpolation
+    let idx_low = max(low, 1u) - 1u;
+    let idx_high = min(low, table_size - 1u);
+    
+    let cdf_low = lookup_table[idx_low];
+    let cdf_high = lookup_table[idx_high];
+    let x_low = x_table[idx_low];
+    let x_high = x_table[idx_high];
+    
+    if (cdf_high - cdf_low < 1.0e-10) {
+        return x_low;
+    }
+    
+    let t = (rng - cdf_low) / (cdf_high - cdf_low);
+    return mix(x_low, x_high, t);
 }
 "#
     .to_string()
@@ -111,7 +131,9 @@ pub fn generate_sample_code(dist_type: DistributionType) -> String {
                 .to_string()
         }
         DistributionType::Exponential => "sample_exponential(rng, dist_params.param1)".to_string(),
-        DistributionType::Table => "sample_from_table(rng, dist_params.table_size)".to_string(),
+        DistributionType::Custom => {
+            "sample_from_cdf_table(rng, dist_params.table_size)".to_string()
+        }
     }
 }
 
@@ -134,7 +156,7 @@ mod tests {
         assert!(lib.contains("sample_uniform"));
         assert!(lib.contains("sample_normal_box_muller"));
         assert!(lib.contains("sample_exponential"));
-        assert!(lib.contains("sample_from_table"));
+        assert!(lib.contains("sample_from_cdf_table"));
     }
 
     #[test]
@@ -142,7 +164,7 @@ mod tests {
         let _ = DistributionType::Uniform;
         let _ = DistributionType::Normal;
         let _ = DistributionType::Exponential;
-        let _ = DistributionType::Table;
+        let _ = DistributionType::Custom;
     }
 
     #[test]
@@ -179,9 +201,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_code_table() {
-        let code = generate_sample_code(DistributionType::Table);
-        assert!(code.contains("sample_from_table"));
+    fn test_sample_code_custom() {
+        let code = generate_sample_code(DistributionType::Custom);
+        assert!(code.contains("sample_from_cdf_table"));
     }
 
     #[test]
@@ -198,7 +220,7 @@ mod tests {
         let code = generate_rng_code(DistributionType::Exponential);
         assert!(code.contains("random_uniform"));
 
-        let code = generate_rng_code(DistributionType::Table);
+        let code = generate_rng_code(DistributionType::Custom);
         assert!(code.contains("random_uniform"));
     }
 }

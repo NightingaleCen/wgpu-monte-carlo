@@ -332,7 +332,173 @@ class DistributionType(Enum):
     UNIFORM = auto()
     NORMAL = auto()
     EXPONENTIAL = auto()
-    TABLE = auto()  # Lookup table-based sampling
+    CUSTOM = auto()
+
+
+def _find_support(
+    pdf: Callable,
+    threshold_ratio: float = 1e-5,
+    max_hard_limit: float = 10000.0,
+) -> tuple:
+    """Automatically detect the effective support of a PDF.
+
+    Algorithm: Locate - Peak Find - Expand
+
+    Phase 1 (Locate):
+        - Dense coverage [-4, 4] with step 0.5: catches bounded distributions like Beta
+        - Exponential coverage [-1024, 1024]: handles shifted/heavy-tailed distributions
+
+    Phase 2 (Peak Find): Local hill climbing to find peak
+    Phase 3 (Expand): Expand from peak until pdf drops below threshold
+
+    Args:
+        pdf: PDF function
+        threshold_ratio: Relative truncation threshold (relative to peak)
+        max_hard_limit: Safety hard limit for expansion
+
+    Returns:
+        (x_min, x_max): Support boundaries
+
+    Raises:
+        ValueError: If PDF is zero everywhere in scanned range
+    """
+    import math
+
+    # Search grid design:
+    # - Dense coverage [-4, 4] with step 0.5: catches bounded distributions like Beta
+    # - Exponential coverage [-1024, 1024]: handles shifted/heavy-tailed distributions
+    points = set()
+    for i in range(-8, 9):
+        points.add(i * 0.5)
+    for exp in range(4, 11):
+        points.add(2**exp)
+        points.add(-(2**exp))
+    scan_points = sorted(points)
+
+    first_nonzero_x = None
+    first_nonzero_val = None
+    for x in scan_points:
+        try:
+            val = pdf(x)
+            if val > 0 and math.isfinite(val):
+                first_nonzero_x = x
+                first_nonzero_val = val
+                break
+        except (ValueError, TypeError, OverflowError):
+            continue
+
+    if first_nonzero_x is None:
+        raise ValueError(
+            "PDF is zero everywhere in scanned range [-4, 4] (step=0.5) and [-1024, 1024] (exponential).\n"
+            "This may happen if your distribution is:\n"
+            "  - Bounded and located outside [-4, 4] (e.g., Uniform(10, 10.1))\n"
+            "  - Heavily shifted (e.g., N(1000, 1)) but not detected by exponential scan\n\n"
+            "Solution: Manually specify the support parameter:\n"
+            "  dist = Distribution.from_pdf(your_pdf, support=(x_min, x_max))\n\n"
+            "Example for Uniform(5, 10):\n"
+            "  def my_pdf(x):\n"
+            "      return 0.2 if 5 <= x < 10 else 0.0\n"
+            "  dist = Distribution.from_pdf(my_pdf, support=(5.0, 10.0))"
+        )
+
+    peak_x = first_nonzero_x
+    peak_val = first_nonzero_val
+
+    step_size = 1.0
+    max_climb_iterations = 100
+    for _ in range(max_climb_iterations):
+        left_val = (
+            pdf(peak_x - step_size) if peak_x - step_size > -max_hard_limit else 0
+        )
+        right_val = (
+            pdf(peak_x + step_size) if peak_x + step_size < max_hard_limit else 0
+        )
+
+        if left_val > peak_val:
+            peak_x = peak_x - step_size
+            peak_val = left_val
+        elif right_val > peak_val:
+            peak_x = peak_x + step_size
+            peak_val = right_val
+        else:
+            step_size /= 2
+            if step_size < 1e-6:
+                break
+
+    threshold = peak_val * threshold_ratio
+
+    x_min = peak_x
+    step = 0.1
+    while x_min > -max_hard_limit:
+        try:
+            val = pdf(x_min - step)
+            if val <= 0 or val < threshold:
+                x_min = x_min - step
+                break
+            x_min = x_min - step
+            step *= 2
+        except (ValueError, TypeError, OverflowError):
+            break
+
+    x_max = peak_x
+    step = 0.1
+    while x_max < max_hard_limit:
+        try:
+            val = pdf(x_max + step)
+            if val <= 0 or val < threshold:
+                x_max = x_max + step
+                break
+            x_max = x_max + step
+            step *= 2
+        except (ValueError, TypeError, OverflowError):
+            break
+
+    return x_min, x_max
+
+
+def _compute_cdf_table(
+    pdf: Callable,
+    x_min: float,
+    x_max: float,
+    n_points: int = 2048,
+) -> tuple:
+    """Compute normalized CDF lookup table on support.
+
+    Uses trapezoidal rule for numerical integration and enforces
+    normalization to ensure CDF endpoint is exactly 1.0.
+
+    Args:
+        pdf: PDF function
+        x_min, x_max: Support boundaries
+        n_points: Number of grid points (minimum 1000)
+
+    Returns:
+        (x_grid, cdf_values): Normalized CDF lookup tables
+
+    Raises:
+        ValueError: If PDF integral is zero
+    """
+    n_points = max(n_points, 1000)
+
+    x_grid = np.linspace(x_min, x_max, n_points)
+    pdf_values = np.array([pdf(x) for x in x_grid])
+
+    pdf_values = np.nan_to_num(pdf_values, nan=0.0, posinf=0.0, neginf=0.0)
+    pdf_values = np.clip(pdf_values, 0, None)
+
+    dx = (x_max - x_min) / (n_points - 1)
+    cdf_values = np.zeros(n_points)
+    cdf_values[1:] = np.cumsum((pdf_values[:-1] + pdf_values[1:]) / 2) * dx
+    cdf_values[0] = 0.0
+
+    total = cdf_values[-1]
+    if total <= 0:
+        raise ValueError(
+            "PDF integral is zero. Please check the PDF function or support range."
+        )
+    cdf_values = cdf_values / total
+
+    return x_grid, cdf_values
 
 
 class Distribution:
@@ -340,6 +506,8 @@ class Distribution:
 
     This class provides factory methods for creating different probability
     distributions that can be used with MonteCarloIntegrator.
+
+    All distributions provide a unified pdf(x) interface for importance sampling.
 
     Examples:
         >>> # Uniform distribution U(0, 1)
@@ -351,23 +519,39 @@ class Distribution:
         >>> # Exponential distribution with lambda=2.0
         >>> dist = Distribution.exponential(lambda_param=2.0)
 
-        >>> # Table-based distribution (e.g., for Beta, Gamma)
-        >>> import numpy as np
-        >>> from scipy.stats import beta
-        >>> # Precompute inverse CDF for Beta(2, 5)
-        >>> probs = np.linspace(0, 1, 2048, endpoint=False)
-        >>> probs = np.clip(probs, 1e-7, 1 - 1e-7)
-        >>> table = beta.ppf(probs, 2.0, 5.0).astype(np.float32)
-        >>> dist = Distribution.from_table(table)
+        >>> # Custom distribution from PDF function
+        >>> import math
+        >>> def my_pdf(x):
+        ...     return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+        >>> dist = Distribution.from_pdf(my_pdf)
+
+        >>> # Beta distribution (convenience method)
+        >>> dist = Distribution.beta(alpha=2.0, beta_param=5.0)
     """
 
-    def __init__(self, dist_type: DistributionType, params: dict):
+    def __init__(
+        self,
+        dist_type: DistributionType,
+        params: dict,
+        pdf_func: Callable[[float], float],
+        x_table: Optional[np.ndarray] = None,
+        cdf_table: Optional[np.ndarray] = None,
+    ):
         self.dist_type = dist_type
         self.params = params
+        self._pdf_func = pdf_func
+        self._x_table = x_table
+        self._cdf_table = cdf_table
+
+    def pdf(self, x: float) -> float:
+        """Evaluate PDF at point x."""
+        return self._pdf_func(x)
 
     @staticmethod
     def uniform(min: float = 0.0, max: float = 1.0) -> "Distribution":
         """Create uniform distribution U(min, max).
+
+        Uses analytical sampling (linear transformation).
 
         Args:
             min: Minimum value (inclusive)
@@ -376,7 +560,16 @@ class Distribution:
         Returns:
             Distribution configured for uniform sampling
         """
-        return Distribution(DistributionType.UNIFORM, {"min": min, "max": max})
+        width = max - min
+
+        def pdf(x: float) -> float:
+            return 1.0 / width if min <= x < max else 0.0
+
+        return Distribution(
+            dist_type=DistributionType.UNIFORM,
+            params={"min": min, "max": max},
+            pdf_func=pdf,
+        )
 
     @staticmethod
     def normal(mean: float = 0.0, std: float = 1.0) -> "Distribution":
@@ -391,7 +584,19 @@ class Distribution:
         Returns:
             Distribution configured for normal sampling
         """
-        return Distribution(DistributionType.NORMAL, {"mean": mean, "std": std})
+        import math
+
+        sqrt_2pi = math.sqrt(2 * math.pi)
+
+        def pdf(x: float) -> float:
+            z = (x - mean) / std
+            return math.exp(-0.5 * z * z) / (std * sqrt_2pi)
+
+        return Distribution(
+            dist_type=DistributionType.NORMAL,
+            params={"mean": mean, "std": std},
+            pdf_func=pdf,
+        )
 
     @staticmethod
     def exponential(lambda_param: float = 1.0) -> "Distribution":
@@ -405,43 +610,68 @@ class Distribution:
         Returns:
             Distribution configured for exponential sampling
         """
-        return Distribution(DistributionType.EXPONENTIAL, {"lambda": lambda_param})
+        import math
+
+        def pdf(x: float) -> float:
+            return lambda_param * math.exp(-lambda_param * x) if x >= 0 else 0.0
+
+        return Distribution(
+            dist_type=DistributionType.EXPONENTIAL,
+            params={"lambda": lambda_param},
+            pdf_func=pdf,
+        )
 
     @staticmethod
-    def from_table(table_data: np.ndarray) -> "Distribution":
-        """Create distribution from precomputed inverse CDF lookup table.
+    def from_pdf(
+        pdf_func: Callable[[float], float],
+        support: Optional[tuple] = None,
+        table_size: int = 2048,
+    ) -> "Distribution":
+        """Create custom distribution from PDF function.
 
-        This enables arbitrary distributions (Beta, Gamma, empirical, etc.)
-        by precomputing the inverse CDF on the CPU using scipy.
-
-        The lookup table should contain quantiles: for each p in [0, 1),
-        table[i] = F^{-1}(p) where F is the CDF.
-
-        TODO: Currently uses table size as provided (typically 2048 elements).
-        Consider using 4096 or 8192 for higher precision in future versions.
+        Automatically detects support and generates CDF lookup table.
 
         Args:
-            table_data: 1D numpy array of float32 values representing inverse CDF
+            pdf_func: PDF function accepting float, returning float
+            support: Optional (x_min, x_max) tuple to skip auto-detection
+            table_size: Number of points in lookup table (default: 2048)
 
         Returns:
             Distribution configured for table-based sampling
 
+        Raises:
+            ValueError: If PDF is invalid or integral is zero
+
         Example:
-            >>> from scipy.stats import beta
-            >>> probs = np.linspace(0, 1, 2048, endpoint=False)
-            >>> table = beta.ppf(probs, 2.0, 5.0).astype(np.float32)
-            >>> dist = Distribution.from_table(table)
+            >>> import math
+            >>> def my_pdf(x):
+            ...     return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+            >>> dist = Distribution.from_pdf(my_pdf)
         """
+        if not callable(pdf_func):
+            raise TypeError("pdf_func must be callable")
+
+        if support is not None:
+            x_min, x_max = support
+        else:
+            x_min, x_max = _find_support(pdf_func)
+
+        x_table, cdf_table = _compute_cdf_table(pdf_func, x_min, x_max, table_size)
+        actual_size = len(x_table)
+
         return Distribution(
-            DistributionType.TABLE, {"table": table_data, "table_size": len(table_data)}
+            dist_type=DistributionType.CUSTOM,
+            params={"table_size": actual_size, "support": (x_min, x_max)},
+            pdf_func=pdf_func,
+            x_table=x_table.astype(np.float32),
+            cdf_table=cdf_table.astype(np.float32),
         )
 
     @staticmethod
     def beta(alpha: float, beta_param: float, table_size: int = 2048) -> "Distribution":
-        """Create Beta distribution using lookup table method.
+        """Create Beta distribution from PDF function.
 
-        This is a convenience method that automatically generates the lookup
-        table using scipy.stats.beta.ppf if scipy is available.
+        Uses from_pdf internally with known support [0, 1].
 
         Args:
             alpha: First shape parameter
@@ -455,16 +685,19 @@ class Distribution:
             ImportError: If scipy is not installed
         """
         try:
-            from scipy.stats import beta as beta_dist
+            from scipy.special import beta as beta_fn
 
-            probs = np.linspace(0, 1, table_size, endpoint=False)
-            probs = np.clip(probs, 1e-7, 1 - 1e-7)
-            table = beta_dist.ppf(probs, alpha, beta_param).astype(np.float32)
-            return Distribution.from_table(table)
+            B = beta_fn(alpha, beta_param)
+
+            def pdf(x: float) -> float:
+                if 0 < x < 1:
+                    return (x ** (alpha - 1)) * ((1 - x) ** (beta_param - 1)) / B
+                return 0.0
+
+            return Distribution.from_pdf(pdf, support=(0.0, 1.0), table_size=table_size)
         except ImportError:
             raise ImportError(
-                "scipy is required for automatic Beta distribution generation. "
-                "Install with: pip install scipy"
+                "scipy is required for Beta distribution. Install with: pip install scipy"
             )
 
 
@@ -605,11 +838,14 @@ class MonteCarloIntegrator:
                     f"Function must be callable or WGSL string, got {type(func)}"
                 )
 
-        # Prepare lookup table if needed
-        lookup_table = None
-        if distribution.dist_type == DistributionType.TABLE:
-            if "table" in distribution.params:
-                lookup_table = distribution.params["table"]
+        # Prepare CDF tables for custom distributions
+        x_table = None
+        cdf_table = None
+        if distribution.dist_type == DistributionType.CUSTOM:
+            if distribution._x_table is not None:
+                x_table = distribution._x_table
+            if distribution._cdf_table is not None:
+                cdf_table = distribution._cdf_table
 
         # Convert distribution type to string
         dist_type_str = distribution.dist_type.name.lower()
@@ -621,7 +857,8 @@ class MonteCarloIntegrator:
             distribution.params,
             n_samples,
             seed,
-            lookup_table,
+            x_table,
+            cdf_table,
             self._target_threads,
         )
 

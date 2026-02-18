@@ -116,16 +116,17 @@ impl MonteCarloIntegrator {
     ///
     /// Args:
     ///     functions: List of WGSL function code strings
-    ///     dist_type: Distribution type ("uniform", "normal", "exponential", "table")
+    ///     dist_type: Distribution type ("uniform", "normal", "exponential", "custom")
     ///     dist_params: Distribution parameters as dict
     ///     n_samples: Total number of Monte Carlo samples
     ///     seed: Random seed
-    ///     lookup_table: Optional lookup table for table-based distributions
+    ///     x_table: Optional x values for custom CDF table
+    ///     cdf_table: Optional CDF values for custom distribution
     ///     target_threads: Optional target thread count (defaults to 65536)
     ///
     /// Returns:
     ///     Vec<f32> of expected values (one per function)
-    #[pyo3(signature = (functions, dist_type, dist_params, n_samples, seed, lookup_table=None, target_threads=None))]
+    #[pyo3(signature = (functions, dist_type, dist_params, n_samples, seed, x_table=None, cdf_table=None, target_threads=None))]
     fn integrate<'py>(
         &mut self,
         py: Python<'py>,
@@ -134,7 +135,8 @@ impl MonteCarloIntegrator {
         dist_params: &Bound<'_, pyo3::types::PyDict>,
         n_samples: u64,
         seed: u32,
-        lookup_table: Option<PyReadonlyArray1<f32>>,
+        x_table: Option<PyReadonlyArray1<f32>>,
+        cdf_table: Option<PyReadonlyArray1<f32>>,
         target_threads: Option<u32>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let k = functions.len();
@@ -147,10 +149,14 @@ impl MonteCarloIntegrator {
         // Parse distribution parameters
         let dist_params_buffer = Self::parse_dist_params(dist_type, dist_params)?;
 
-        // Convert lookup table if provided
-        let table_data: Option<Vec<f32>> =
-            lookup_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
-        let table_ref: Option<&[f32]> = table_data.as_deref();
+        // Convert CDF tables if provided (for custom distributions)
+        let x_table_data: Option<Vec<f32>> =
+            x_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let x_table_ref: Option<&[f32]> = x_table_data.as_deref();
+
+        let cdf_table_data: Option<Vec<f32>> =
+            cdf_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let cdf_table_ref: Option<&[f32]> = cdf_table_data.as_deref();
 
         // Setup integration
         let config = self
@@ -159,7 +165,8 @@ impl MonteCarloIntegrator {
                 n_samples,
                 k,
                 &dist_params_buffer,
-                table_ref,
+                x_table_ref,
+                cdf_table_ref,
                 seed,
                 target_threads,
             )
@@ -267,7 +274,7 @@ impl MonteCarloIntegrator {
                     table_size: 0,
                 })
             }
-            "table" => {
+            "custom" => {
                 let table_size = params
                     .get_item("table_size")?
                     .and_then(|v| v.extract::<u32>().ok())
@@ -280,7 +287,7 @@ impl MonteCarloIntegrator {
                 })
             }
             _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown distribution type: {}. Use 'uniform', 'normal', 'exponential', or 'table'",
+                "Unknown distribution type: {}. Use 'uniform', 'normal', 'exponential', or 'custom'",
                 dist_type
             ))),
         }
@@ -292,7 +299,7 @@ impl MonteCarloIntegrator {
             0 => DistributionType::Uniform,
             1 => DistributionType::Normal,
             2 => DistributionType::Exponential,
-            3 => DistributionType::Table,
+            3 => DistributionType::Custom,
             _ => DistributionType::Uniform,
         }
     }

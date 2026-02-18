@@ -7,8 +7,9 @@ GPU-accelerated Monte Carlo integration using WebGPU (wgpu) and PyO3. Calculate 
 - **GPU Acceleration**: WebGPU compute for massive parallel execution
 - **Multi-Function Fusion**: Evaluate K functions on same samples in one GPU pass
 - **Pythonic API**: Write Python functions, auto-transpiled to WGSL shaders
-- **Native Distributions**: Uniform, Normal (Box-Muller), Exponential
-- **Table-Based Sampling**: Beta, Gamma, and arbitrary distributions via lookup tables
+- **Native Distributions**: Uniform, Normal (Box-Muller), Exponential (analytical sampling)
+- **Custom Distributions**: Define any distribution via PDF function, auto-generates CDF table
+- **Beta/Gamma**: Built-in support for common distributions
 - **Cross-Platform**: Works on macOS, Linux, Windows
 
 ## Installation
@@ -47,13 +48,20 @@ print(f"Variance = {variance:.6f}")  # ~1.0
 ### Distributions
 
 ```python
-# Built-in
+# Built-in (analytical sampling)
 dist = Distribution.normal(mean=0.0, std=1.0)
 dist = Distribution.uniform(min=0.0, max=1.0)
 dist = Distribution.exponential(lambda_param=2.0)
 
-# Table-based (requires scipy)
-dist = Distribution.beta(alpha=2.0, beta=5.0)
+# Beta distribution (built-in)
+dist = Distribution.beta(alpha=2.0, beta_param=5.0)
+
+# Custom distribution from PDF function
+import math
+def my_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+dist = Distribution.from_pdf(my_pdf)  # Auto-detects support and generates CDF table
 ```
 
 ### Multiple Functions
@@ -70,19 +78,34 @@ functions = [
 result = integrator.integrate(functions, dist, n_samples=10_000_000)
 ```
 
-### Custom Table Distribution
+### Custom PDF Distribution
+
+Define any distribution by providing its PDF function. The library automatically:
+
+1. Detects the effective support (where PDF > 0)
+2. Generates a normalized CDF lookup table
+3. Uses the table for GPU sampling
 
 ```python
-import numpy as np
-from scipy.stats import gamma
+import math
 
-# Precompute inverse CDF
-probs = np.linspace(0, 1, 2048, endpoint=False)
-probs = np.clip(probs, 1e-7, 1 - 1e-7)
-table = gamma.ppf(probs, 2.0, scale=1.0).astype(np.float32)
+# Define any PDF
+def my_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
 
-dist = Distribution.from_table(table)
+# Auto-generates CDF table and support
+dist = Distribution.from_pdf(my_pdf)
+
+# Or specify support manually for bounded distributions
+def beta_pdf(x):
+    if 0 < x < 1:
+        return 6 * x * (1 - x)  # Beta(2, 2) unnormalized
+    return 0.0
+
+dist = Distribution.from_pdf(beta_pdf, support=(0.0, 1.0))
 ```
+
+All distributions provide a unified `pdf(x)` interface for importance sampling.
 
 ## Transpiler
 

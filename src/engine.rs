@@ -51,6 +51,7 @@ pub struct ComputeEngine {
     output_buffer: Option<Buffer>,
     staging_buffer: Option<Buffer>,
     lookup_table_buffer: Option<Buffer>,
+    x_table_buffer: Option<Buffer>,
     compute_pipeline: Option<wgpu::ComputePipeline>,
     bind_group: Option<wgpu::BindGroup>,
     workgroup_size: u32,
@@ -90,6 +91,7 @@ impl ComputeEngine {
             output_buffer: None,
             staging_buffer: None,
             lookup_table_buffer: None,
+            x_table_buffer: None,
             compute_pipeline: None,
             bind_group: None,
             workgroup_size: 64,
@@ -380,7 +382,8 @@ impl ComputeEngine {
         n_samples: u64,
         k_functions: usize,
         dist_params: &DistributionParamsBuffer,
-        lookup_table: Option<&[f32]>,
+        x_table: Option<&[f32]>,
+        cdf_table: Option<&[f32]>,
         seed: u32,
         target_threads: Option<u32>,
     ) -> Result<DispatchConfig> {
@@ -422,11 +425,11 @@ impl ComputeEngine {
             bytemuck::cast_slice(&[*dist_params]),
         );
 
-        // Create lookup table buffer if provided (for table-based distributions)
+        // Create CDF tables buffer if provided (for custom distributions)
         // Otherwise create a small dummy buffer (required by the shader layout)
-        if let Some(table_data) = lookup_table {
+        if let Some(table_data) = cdf_table {
             self.lookup_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Lookup Table Buffer"),
+                label: Some("CDF Table Buffer"),
                 size: (table_data.len() * std::mem::size_of::<f32>()) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -438,9 +441,9 @@ impl ComputeEngine {
                 bytemuck::cast_slice(table_data),
             );
         } else {
-            // Create a dummy 1-element buffer for non-table distributions
+            // Create a dummy 1-element buffer for non-custom distributions
             self.lookup_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Dummy Lookup Table Buffer"),
+                label: Some("Dummy CDF Table Buffer"),
                 size: std::mem::size_of::<f32>() as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -448,6 +451,37 @@ impl ComputeEngine {
 
             self.queue.write_buffer(
                 self.lookup_table_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&[0.0f32]),
+            );
+        }
+
+        // Create x_table buffer if provided (for custom distributions)
+        // x_table contains the x values corresponding to cdf_table
+        if let Some(x_data) = x_table {
+            self.x_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("X Table Buffer"),
+                size: (x_data.len() * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+            self.queue.write_buffer(
+                self.x_table_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(x_data),
+            );
+        } else {
+            // Create a dummy buffer
+            self.x_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Dummy X Table Buffer"),
+                size: std::mem::size_of::<f32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+            self.queue.write_buffer(
+                self.x_table_buffer.as_ref().unwrap(),
                 0,
                 bytemuck::cast_slice(&[0.0f32]),
             );
@@ -513,7 +547,7 @@ impl ComputeEngine {
                 },
                 count: None,
             },
-            // Lookup table (storage, read-only) - binding 2
+            // CDF table (storage, read-only) - binding 2
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -524,9 +558,20 @@ impl ComputeEngine {
                 },
                 count: None,
             },
-            // Output buffer (storage, read-write) - binding 3
+            // X table (storage, read-only) - binding 3
             wgpu::BindGroupLayoutEntry {
                 binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Output buffer (storage, read-write) - binding 4
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -579,7 +624,7 @@ impl ComputeEngine {
             },
         ];
 
-        // Add lookup table binding (always present - dummy for non-table distributions)
+        // Add CDF table binding (always present - dummy for non-custom distributions)
         bind_entries.push(wgpu::BindGroupEntry {
             binding: 2,
             resource: self
@@ -589,8 +634,14 @@ impl ComputeEngine {
                 .as_entire_binding(),
         });
 
+        // Add X table binding
         bind_entries.push(wgpu::BindGroupEntry {
             binding: 3,
+            resource: self.x_table_buffer.as_ref().unwrap().as_entire_binding(),
+        });
+
+        bind_entries.push(wgpu::BindGroupEntry {
+            binding: 4,
             resource: self.output_buffer.as_ref().unwrap().as_entire_binding(),
         });
 

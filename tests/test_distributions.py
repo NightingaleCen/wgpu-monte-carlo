@@ -59,10 +59,14 @@ class TestDistributionCreation:
         assert dist.params["lambda"] == 2.0
 
     def test_from_table_creation(self):
-        """Test table-based distribution creation."""
-        table = np.linspace(0, 1, 2048, endpoint=False).astype(np.float32)
-        dist = Distribution.from_table(table)
-        assert dist.dist_type.name == "TABLE"
+        """Test custom distribution creation via from_pdf."""
+        import math
+
+        def pdf(x):
+            return 1.0 if 0 <= x < 1 else 0.0
+
+        dist = Distribution.from_pdf(pdf, support=(0.0, 1.0))
+        assert dist.dist_type.name == "CUSTOM"
         assert dist.params["table_size"] == 2048
 
 
@@ -77,14 +81,7 @@ class TestBetaDistribution:
         beta_param = 5.0
         n_samples = 10_000_000
 
-        table_size = 2048
-        probabilities = np.linspace(0, 1, table_size, endpoint=False)
-        probabilities = np.clip(probabilities, 1e-7, 1 - 1e-7)
-        lookup_table = beta_dist.ppf(probabilities, alpha, beta_param).astype(
-            np.float32
-        )
-
-        dist = Distribution.from_table(lookup_table)
+        dist = Distribution.beta(alpha, beta_param, table_size=2048)
 
         functions = [f_identity, f_square, f_cube]
 
@@ -136,10 +133,14 @@ class TestBetaDistribution:
 
     def test_table_vs_direct(self):
         """Compare table-based sampling with direct uniform sampling."""
+        import math
+
         n_samples = 1_000_000
 
-        table = np.linspace(0, 1, 2048, endpoint=False).astype(np.float32)
-        dist_table = Distribution.from_table(table)
+        def uniform_pdf(x):
+            return 1.0 if 0 <= x < 1 else 0.0
+
+        dist_table = Distribution.from_pdf(uniform_pdf, support=(0.0, 1.0))
         dist_direct = Distribution.uniform(0.0, 1.0)
 
         functions = [f_identity, f_square]
@@ -251,6 +252,190 @@ class TestExponentialDistribution:
 
         expected_var = 1.0 / (lam * lam)
         assert abs(variance - expected_var) < 0.01
+
+
+@pytest.mark.skipif(not HAS_EXTENSION, reason="Rust extension not built")
+class TestCustomDistribution:
+    """Test custom distribution from PDF function."""
+
+    def test_custom_pdf_interface(self):
+        """Test that all distributions provide pdf(x) interface."""
+        import math
+
+        dist_uniform = Distribution.uniform(0.0, 1.0)
+        dist_normal = Distribution.normal(0.0, 1.0)
+        dist_exponential = Distribution.exponential(1.0)
+
+        assert abs(dist_uniform.pdf(0.5) - 1.0) < 0.001
+        assert abs(dist_normal.pdf(0.0) - 0.3989) < 0.001
+        assert abs(dist_exponential.pdf(0.0) - 1.0) < 0.001
+
+    def test_custom_distribution_from_pdf(self):
+        """Test creating distribution from PDF function."""
+        import math
+
+        def my_pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        dist = Distribution.from_pdf(my_pdf)
+        assert dist.dist_type.name == "CUSTOM"
+        assert dist._x_table is not None
+        assert dist._cdf_table is not None
+
+    def test_custom_distribution_pdf_at_points(self):
+        """Test PDF evaluation at specific points."""
+        import math
+
+        def my_pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        dist = Distribution.from_pdf(my_pdf)
+        assert abs(dist.pdf(0.0) - 0.3989) < 0.001
+        assert abs(dist.pdf(1.0) - 0.2419) < 0.001
+
+    def test_custom_distribution_integration(self):
+        """Test integration with custom distribution."""
+        import math
+
+        def my_pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        dist = Distribution.from_pdf(my_pdf)
+        result = integrate([f_identity, f_square], dist, n_samples=5000000, seed=42)
+
+        assert abs(result.values[0]) < 0.02
+        assert abs(result.values[1] - 1.0) < 0.02
+
+    def test_custom_distribution_with_manual_support(self):
+        """Test custom distribution with manually specified support."""
+        import math
+
+        def uniform_pdf(x):
+            return 1.0 if 0 <= x < 1 else 0.0
+
+        dist = Distribution.from_pdf(uniform_pdf, support=(0.0, 1.0))
+        result = integrate([f_identity], dist, n_samples=1000000, seed=42)
+
+        assert abs(result.values[0] - 0.5) < 0.02
+
+
+@pytest.mark.skipif(not HAS_EXTENSION, reason="Rust extension not built")
+class TestVariableTableSize:
+    """Test variable table size for custom distributions."""
+
+    def test_different_table_sizes(self):
+        """Test that different table sizes are correctly applied."""
+        import math
+
+        def my_pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        for size in [1024, 2048, 4096]:
+            dist = Distribution.from_pdf(my_pdf, support=(-3.0, 3.0), table_size=size)
+            assert dist.params["table_size"] == size
+            assert len(dist._x_table) == size
+            assert len(dist._cdf_table) == size
+
+    def test_table_size_4096_accuracy(self):
+        """Test that larger table size improves accuracy."""
+        import math
+
+        def my_pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        dist = Distribution.from_pdf(my_pdf, support=(-5.0, 5.0), table_size=4096)
+        result = integrate([f_square], dist, n_samples=5000000, seed=42)
+
+        assert abs(result.values[0] - 1.0) < 0.02
+
+    def test_minimum_table_size_enforced(self):
+        """Test that table_size is enforced to minimum 1000."""
+        import math
+
+        def my_pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        dist = Distribution.from_pdf(my_pdf, support=(-5.0, 5.0), table_size=500)
+        assert dist.params["table_size"] == 1000
+        assert len(dist._x_table) == 1000
+
+    def test_bounded_support(self):
+        """Test support detection for bounded distribution (0, 1)."""
+        import math
+
+        def pdf(x):
+            return 6.0 * x * (1.0 - x) if 0 < x < 1 else 0.0
+
+        dist = Distribution.from_pdf(pdf)
+        support = dist.params["support"]
+
+        assert support[0] >= -1.0
+        assert support[1] <= 2.0
+
+
+@pytest.mark.skipif(not HAS_EXTENSION, reason="Rust extension not built")
+class TestEdgeCases:
+    """Test edge cases and error handling."""
+
+    def test_pdf_returns_nan(self):
+        """Test handling of PDF returning NaN with manual support."""
+        import math
+
+        def pdf_nan(x):
+            if abs(x) < 0.1:
+                return float("nan")
+            return math.exp(-0.5 * x * x)
+
+        dist = Distribution.from_pdf(pdf_nan, support=(-3.0, 3.0))
+        assert dist is not None
+        assert abs(dist._cdf_table[-1] - 1.0) < 1e-6
+
+    def test_pdf_returns_inf(self):
+        """Test handling of PDF returning infinity with manual support."""
+        import math
+
+        def pdf_inf(x):
+            return float("inf") if abs(x) < 0.001 else math.exp(-0.5 * x * x)
+
+        dist = Distribution.from_pdf(pdf_inf, support=(-3.0, 3.0))
+        assert dist is not None
+        assert abs(dist._cdf_table[-1] - 1.0) < 1e-6
+
+    def test_pdf_returns_negative(self):
+        """Test handling of PDF returning negative values with manual support."""
+
+        def pdf_negative(x):
+            return 0.9 if 0 <= x < 1 else 0.0
+
+        dist = Distribution.from_pdf(pdf_negative, support=(0.0, 1.0))
+        assert dist is not None
+        assert abs(dist._cdf_table[-1] - 1.0) < 1e-6
+
+    def test_exponential_distribution_pdf_at_boundary(self):
+        """Test exponential PDF at boundaries."""
+        dist = Distribution.exponential(1.0)
+
+        assert dist.pdf(0.0) > 0
+        assert dist.pdf(100.0) < 1e-40
+        assert dist.pdf(-1.0) == 0.0
+
+    def test_uniform_pdf_at_boundaries(self):
+        """Test uniform PDF at boundaries."""
+        dist = Distribution.uniform(0.0, 1.0)
+
+        assert dist.pdf(0.0) == 1.0
+        assert dist.pdf(0.999) == 1.0
+        assert dist.pdf(1.0) == 0.0
+        assert dist.pdf(-0.001) == 0.0
+        assert dist.pdf(1.001) == 0.0
+
+    def test_beta_distribution_pdf_at_boundaries(self):
+        """Test Beta distribution PDF at boundaries."""
+        dist = Distribution.beta(2.0, 5.0)
+
+        assert dist.pdf(0.0) == 0.0
+        assert dist.pdf(1.0) == 0.0
+        assert dist.pdf(0.5) > 0
 
 
 if __name__ == "__main__":

@@ -62,6 +62,9 @@ var<uniform> dist_params: DistParams;
 var<storage, read> lookup_table: array<f32>;
 
 @group(0) @binding(3)
+var<storage, read> x_table: array<f32>;
+
+@group(0) @binding(4)
 var<storage, read_write> output_buffer: array<f32>;
 
 {distribution_library}
@@ -288,13 +291,14 @@ mod tests {
     fn test_shader_table_sampling_in_output() {
         let config = IntegrationShaderConfig {
             user_functions: vec!["fn f(x: f32) -> f32 { return x; }".to_string()],
-            dist_type: DistributionType::Table,
+            dist_type: DistributionType::Custom,
             workgroup_size: 256,
         };
 
         let shader = generate_integration_shader(&config, 100);
-        assert!(shader.contains("sample_from_table"));
+        assert!(shader.contains("sample_from_cdf_table"));
         assert!(shader.contains("lookup_table"));
+        assert!(shader.contains("x_table"));
     }
 }
 
