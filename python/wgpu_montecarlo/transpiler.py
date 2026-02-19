@@ -659,6 +659,8 @@ class PythonToWGSL:
             return self._visit_conditional(node)
         elif isinstance(node, ast.Compare):
             return self._visit_compare(node)
+        elif isinstance(node, ast.BoolOp):
+            return self._visit_boolop(node)
         elif isinstance(node, ast.Attribute):
             return self._visit_attribute(node)
         else:
@@ -788,6 +790,19 @@ class PythonToWGSL:
             raise TranspilerError(f"Unsupported comparison operator: {op_type}")
 
         return f"({left} {op} {right})"
+
+    def _visit_boolop(self, node: ast.BoolOp) -> str:
+        """Visit a boolean operation (and/or)."""
+        values = [self._visit_expression(v) for v in node.values]
+
+        if isinstance(node.op, ast.And):
+            return "(" + " && ".join(values) + ")"
+        elif isinstance(node.op, ast.Or):
+            return "(" + " || ".join(values) + ")"
+        else:
+            raise TranspilerError(
+                f"Unsupported boolean operator: {type(node.op).__name__}"
+            )
 
 
 def transpile_function(func: Callable) -> str:

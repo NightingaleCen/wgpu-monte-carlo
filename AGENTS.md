@@ -7,6 +7,13 @@ Hybrid Rust + Python GPU-accelerated Monte Carlo simulation library using:
 - **Python**: User API, Python→WGSL transpiler (`python/`)
 - **Build**: Maturin (via uv) for Python extension compilation
 
+## Features
+
+- **Monte Carlo Integration**: Calculate E[f(X)] for arbitrary functions
+- **Importance Sampling**: Efficient estimation using proposal distributions
+- **PDF Table Support**: Handle non-transpilable PDFs via lookup tables
+- **Multi-Function Fusion**: Evaluate K functions on same samples in one GPU pass
+
 ## Build Commands
 
 ```bash
@@ -31,8 +38,8 @@ uv run pytest tests/ -v
 
 # Run single test file
 uv run pytest tests/test_transpiler.py -v
-uv run pytest tests/test_integration.py -v
-uv run pytest tests/test_distributions.py -v
+uv run pytest tests/test_integrator.py -v
+uv run pytest tests/test_importance_sampling.py -v
 
 # Run specific test class
 uv run pytest tests/test_transpiler.py::TestTranspiler -v
@@ -41,7 +48,7 @@ uv run pytest tests/test_transpiler.py::TestTranspiler -v
 uv run pytest tests/test_transpiler.py::TestTranspiler::test_simple_function -v
 
 # Run with GPU tests (requires compatible GPU)
-uv run pytest tests/test_integration.py -v
+uv run pytest tests/test_integrator.py -v
 
 # Run transpiler tests only (no GPU required)
 uv run pytest tests/test_transpiler.py -v
@@ -77,27 +84,31 @@ uv run pytest tests/test_transpiler.py -v
 | Integration Tests | Test end-to-end functionality | Yes |
 | Transpiler Tests | Test Python→WGSL conversion | No |
 | Distribution Tests | Test probability distributions | Yes |
+| Importance Sampling Tests | Test IS with transpilable and table-based PDFs | Yes |
 
-### Distribution Tests
+### Importance Sampling Tests
 
-When adding tests for `Distribution.from_pdf()`:
-- Test automatic support detection for bounded distributions (e.g., Beta in (0,1))
-- Test support detection for shifted distributions (e.g., N(100, 1))
-- Test edge cases: PDF returns NaN, inf, negative values
-- Test that user-specified `support` parameter works correctly
-- Test numerical accuracy with different `table_size` values
+When adding tests for importance sampling:
+- Test both transpilable and non-transpilable PDFs
+- Test mixed scenarios (one transpilable, one table-based)
+- Test `from_pdf_table()` API with pre-computed tables
+- Test arbitrary table sizes
+- Verify numerical accuracy against known results
 
 Example:
 ```python
-def test_bounded_support_auto_detection(self):
-    """Test that bounded distribution (0, 1) is auto-detected without support param."""
-    # PDF only non-zero in (0, 1)
-    def pdf(x):
-        return 6.0 * x * (1.0 - x) if 0 < x < 1 else 0.0
+def test_non_transpilable_pdf_uses_table(self):
+    """Non-transpilable PDF should use table lookup."""
+    def my_pdf(x):
+        return float(int(x) % 2) * 0.5 + 0.1  # Uses int(), not transpilable
 
-    # Should auto-detect without manual support
-    dist = Distribution.from_pdf(pdf)
-    assert dist is not None
+    target = Distribution.from_pdf(my_pdf, support=(0.0, 10.0))
+    proposal = Distribution.uniform(0.0, 10.0)
+
+    result = integrator.integrate_importance_sampling(
+        [lambda x: 1.0], target, proposal, n_samples=1_000_000
+    )
+    assert len(result.values) == 1
 ```
 
 ## Lint/Format Commands

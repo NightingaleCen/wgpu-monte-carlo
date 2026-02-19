@@ -4,7 +4,8 @@
 //! on the same random samples in a single GPU pass.
 
 use crate::distribution::{
-    generate_distribution_library, generate_rng_code, generate_sample_code, DistributionType,
+    generate_distribution_library, generate_pdf_table_bindings, generate_pdf_table_functions,
+    generate_rng_code, generate_sample_code, DistributionType, PdfTableConfig,
 };
 
 /// Configuration for integration shader generation
@@ -12,6 +13,14 @@ pub struct IntegrationShaderConfig {
     pub user_functions: Vec<String>,
     pub dist_type: DistributionType,
     pub workgroup_size: u32,
+}
+
+/// Extended configuration for integration shader with PDF table support
+pub struct IntegrationShaderConfigWithPdfTables {
+    pub user_functions: Vec<String>,
+    pub dist_type: DistributionType,
+    pub workgroup_size: u32,
+    pub pdf_table_config: PdfTableConfig,
 }
 
 /// Generate a multi-function integration compute shader
@@ -98,6 +107,103 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
 }}
 "#,
         distribution_library = dist_lib,
+        user_functions = user_funcs_code,
+        workgroup_size = config.workgroup_size,
+        accumulator_init = accumulator_init,
+        rng_code = rng_code,
+        sample_code = sample_code,
+        accumulation_code = accumulation_code,
+        output_write_code = output_write_code,
+    )
+}
+
+/// Generate a multi-function integration compute shader with PDF table support
+///
+/// This is an extended version that supports importance sampling with PDF lookup tables.
+/// The PDF tables are stored in interleaved format: [table_size, x0, pdf0, x1, pdf1, ...]
+pub fn generate_integration_shader_with_pdf_tables(
+    config: &IntegrationShaderConfigWithPdfTables,
+    _loops_per_thread: u32,
+) -> String {
+    let k = config.user_functions.len();
+    let dist_lib = generate_distribution_library();
+    let pdf_bindings = generate_pdf_table_bindings(&config.pdf_table_config);
+    let pdf_functions = generate_pdf_table_functions(&config.pdf_table_config);
+    let user_funcs_code = generate_user_functions(&config.user_functions);
+    let accumulator_init = generate_accumulator_init(k);
+    let sample_code = generate_sample_code(config.dist_type);
+    let rng_code = generate_rng_code(config.dist_type);
+    let accumulation_code = generate_accumulation_code(k);
+    let output_write_code = generate_output_write(k);
+
+    format!(
+        r#"struct IntegrationParams {{
+    n_threads: u32,
+    loops_per_thread: u32,
+    seed: u32,
+    k_functions: u32,
+    _padding: u32,
+}}
+
+struct DistParams {{
+    param1: f32,
+    param2: f32,
+    dist_type: u32,
+    table_size: u32,
+}}
+
+@group(0) @binding(0)
+var<uniform> params: IntegrationParams;
+
+@group(0) @binding(1)
+var<uniform> dist_params: DistParams;
+
+@group(0) @binding(2)
+var<storage, read> lookup_table: array<f32>;
+
+@group(0) @binding(3)
+var<storage, read> x_table: array<f32>;
+
+@group(0) @binding(4)
+var<storage, read_write> output_buffer: array<f32>;
+
+{pdf_bindings}
+
+{distribution_library}
+
+{pdf_functions}
+
+{user_functions}
+
+@compute @workgroup_size({workgroup_size})
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {{
+    let idx = global_id.x;
+    
+    if (idx >= params.n_threads) {{
+        return;
+    }}
+    
+    // Initialize K accumulators in registers (fast local memory)
+    {accumulator_init}
+    
+    // Main integration loop
+    for (var i = 0u; i < params.loops_per_thread; i = i + 1u) {{
+        // Generate random sample from distribution
+        {rng_code}
+        let sample = {sample_code};
+        
+        // Evaluate all K functions on the same sample, accumulate
+        {accumulation_code}
+    }}
+    
+    // Write results to output buffer (flattened layout: output[thread_id * K + metric_id])
+    let base_idx = idx * params.k_functions;
+    {output_write_code}
+}}
+"#,
+        pdf_bindings = pdf_bindings,
+        distribution_library = dist_lib,
+        pdf_functions = pdf_functions,
         user_functions = user_funcs_code,
         workgroup_size = config.workgroup_size,
         accumulator_init = accumulator_init,

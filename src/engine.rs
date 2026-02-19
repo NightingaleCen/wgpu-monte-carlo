@@ -42,6 +42,17 @@ pub struct DispatchConfig {
     pub total_threads: u32,
 }
 
+/// Configuration for PDF tables in importance sampling
+#[derive(Debug, Default)]
+pub struct PdfTableBuffers {
+    pub target_pdf_buffer: Option<Buffer>,
+    pub proposal_pdf_buffer: Option<Buffer>,
+    pub has_target: bool,
+    pub has_proposal: bool,
+    pub target_size: u32,
+    pub proposal_size: u32,
+}
+
 pub struct ComputeEngine {
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -55,6 +66,8 @@ pub struct ComputeEngine {
     compute_pipeline: Option<wgpu::ComputePipeline>,
     bind_group: Option<wgpu::BindGroup>,
     workgroup_size: u32,
+    // PDF table buffers for importance sampling
+    pdf_buffers: PdfTableBuffers,
 }
 
 impl ComputeEngine {
@@ -95,6 +108,7 @@ impl ComputeEngine {
             compute_pipeline: None,
             bind_group: None,
             workgroup_size: 64,
+            pdf_buffers: PdfTableBuffers::default(),
         })
     }
 
@@ -715,5 +729,290 @@ impl ComputeEngine {
         staging_buffer.unmap();
 
         Ok(result)
+    }
+
+    // ========================================
+    // Importance Sampling with PDF Tables
+    // ========================================
+
+    /// Create interleaved PDF data buffer
+    /// Format: [table_size, x0, pdf0, x1, pdf1, ..., xn, pdfn]
+    pub fn create_interleaved_pdf_buffer(
+        &self,
+        x_table: &[f32],
+        pdf_table: &[f32],
+        label: &str,
+    ) -> Result<Buffer> {
+        let table_size = x_table.len();
+        if table_size != pdf_table.len() {
+            anyhow::bail!("x_table and pdf_table must have the same length");
+        }
+
+        // Interleaved format: [table_size, x0, pdf0, x1, pdf1, ...]
+        let data_size = 1 + table_size * 2;
+        let mut data = Vec::with_capacity(data_size);
+        data.push(table_size as f32);
+        for i in 0..table_size {
+            data.push(x_table[i]);
+            data.push(pdf_table[i]);
+        }
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (data_size * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&data));
+
+        Ok(buffer)
+    }
+
+    /// Setup integration with PDF tables for importance sampling
+    pub fn setup_integration_with_pdf_tables(
+        &mut self,
+        n_samples: u64,
+        k_functions: usize,
+        dist_params: &DistributionParamsBuffer,
+        x_table: Option<&[f32]>,
+        cdf_table: Option<&[f32]>,
+        target_x_table: Option<&[f32]>,
+        target_pdf_table: Option<&[f32]>,
+        proposal_x_table: Option<&[f32]>,
+        proposal_pdf_table: Option<&[f32]>,
+        seed: u32,
+        target_threads: Option<u32>,
+    ) -> Result<DispatchConfig> {
+        // First run standard setup
+        let config = self.setup_integration(
+            n_samples,
+            k_functions,
+            dist_params,
+            x_table,
+            cdf_table,
+            seed,
+            target_threads,
+        )?;
+
+        // Create PDF table buffers
+        if let (Some(x_tbl), Some(pdf_tbl)) = (target_x_table, target_pdf_table) {
+            self.pdf_buffers.target_pdf_buffer =
+                Some(self.create_interleaved_pdf_buffer(x_tbl, pdf_tbl, "Target PDF Table")?);
+            self.pdf_buffers.has_target = true;
+            self.pdf_buffers.target_size = x_tbl.len() as u32;
+        }
+
+        if let (Some(x_tbl), Some(pdf_tbl)) = (proposal_x_table, proposal_pdf_table) {
+            self.pdf_buffers.proposal_pdf_buffer =
+                Some(self.create_interleaved_pdf_buffer(x_tbl, pdf_tbl, "Proposal PDF Table")?);
+            self.pdf_buffers.has_proposal = true;
+            self.pdf_buffers.proposal_size = x_tbl.len() as u32;
+        }
+
+        Ok(config)
+    }
+
+    /// Get PDF table configuration for shader generation
+    pub fn get_pdf_table_config(&self) -> crate::distribution::PdfTableConfig {
+        crate::distribution::PdfTableConfig {
+            has_target_pdf_table: self.pdf_buffers.has_target,
+            has_proposal_pdf_table: self.pdf_buffers.has_proposal,
+            target_table_size: self.pdf_buffers.target_size,
+            proposal_table_size: self.pdf_buffers.proposal_size,
+        }
+    }
+
+    /// Create compute pipeline for integration with PDF tables
+    pub fn create_integration_pipeline_with_pdf_tables(&mut self, shader_code: &str) -> Result<()> {
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Integration IS Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_code.into()),
+            });
+
+        // Build dynamic bind group layout entries
+        let mut entries = vec![
+            // Params (uniform) - binding 0
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Distribution params (uniform) - binding 1
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // CDF table (storage, read-only) - binding 2
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // X table (storage, read-only) - binding 3
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Output buffer (storage, read-write) - binding 4
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ];
+
+        let mut next_binding = 5u32;
+
+        // Add target PDF table binding if present
+        if self.pdf_buffers.has_target {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: next_binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+            next_binding += 1;
+        }
+
+        // Add proposal PDF table binding if present
+        if self.pdf_buffers.has_proposal {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: next_binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
+
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Integration IS Bind Group Layout"),
+                    entries: &entries,
+                });
+
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Integration IS Pipeline Layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        self.compute_pipeline = Some(self.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("Integration IS Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+        ));
+
+        // Build bind group entries
+        let mut bind_entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.params_buffer.as_ref().unwrap().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: self
+                    .dist_params_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: self
+                    .lookup_table_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: self.x_table_buffer.as_ref().unwrap().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: self.output_buffer.as_ref().unwrap().as_entire_binding(),
+            },
+        ];
+
+        let mut next_binding = 5u32;
+
+        if self.pdf_buffers.has_target {
+            bind_entries.push(wgpu::BindGroupEntry {
+                binding: next_binding,
+                resource: self
+                    .pdf_buffers
+                    .target_pdf_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            });
+            next_binding += 1;
+        }
+
+        if self.pdf_buffers.has_proposal {
+            bind_entries.push(wgpu::BindGroupEntry {
+                binding: next_binding,
+                resource: self
+                    .pdf_buffers
+                    .proposal_pdf_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            });
+        }
+
+        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Integration IS Bind Group"),
+            layout: &bind_group_layout,
+            entries: &bind_entries,
+        }));
+
+        Ok(())
     }
 }

@@ -8,7 +8,10 @@ mod shader_gen;
 use distribution::DistributionType;
 use engine::{ComputeEngine, DistributionParamsBuffer};
 use shader_gen::generate_compute_shader;
-use shader_gen::{generate_integration_shader, IntegrationShaderConfig};
+use shader_gen::{
+    generate_integration_shader, generate_integration_shader_with_pdf_tables,
+    IntegrationShaderConfig, IntegrationShaderConfigWithPdfTables,
+};
 
 /// Monte Carlo Simulator (Path-Dependent Simulation)
 #[pyclass]
@@ -209,6 +212,140 @@ impl MonteCarloIntegrator {
             })?;
 
         // CPU-based reduction: average all thread results for each function
+        let n_threads = thread_results.len() / k;
+        let mut final_results = vec![0.0f32; k];
+
+        for func_idx in 0..k {
+            let sum: f32 = (0..n_threads)
+                .map(|thread_idx| thread_results[thread_idx * k + func_idx])
+                .sum();
+            final_results[func_idx] = sum / n_threads as f32;
+        }
+
+        Ok(final_results.to_pyarray(py))
+    }
+
+    /// Integrate with PDF tables for importance sampling
+    ///
+    /// Args:
+    ///     functions: List of WGSL function code strings
+    ///     dist_type: Proposal distribution type
+    ///     dist_params: Proposal distribution parameters as dict
+    ///     n_samples: Total number of Monte Carlo samples
+    ///     seed: Random seed
+    ///     x_table: Optional x values for proposal CDF table
+    ///     cdf_table: Optional CDF values for proposal distribution
+    ///     target_x_table: Optional x values for target PDF table
+    ///     target_pdf_table: Optional target PDF values
+    ///     proposal_x_table: Optional x values for proposal PDF table
+    ///     proposal_pdf_table: Optional proposal PDF values
+    ///     target_threads: Optional target thread count
+    #[pyo3(signature = (
+        functions, dist_type, dist_params, n_samples, seed,
+        x_table=None, cdf_table=None,
+        target_x_table=None, target_pdf_table=None,
+        proposal_x_table=None, proposal_pdf_table=None,
+        target_threads=None
+    ))]
+    fn integrate_is_tables<'py>(
+        &mut self,
+        py: Python<'py>,
+        functions: Vec<String>,
+        dist_type: &str,
+        dist_params: &Bound<'_, pyo3::types::PyDict>,
+        n_samples: u64,
+        seed: u32,
+        x_table: Option<PyReadonlyArray1<f32>>,
+        cdf_table: Option<PyReadonlyArray1<f32>>,
+        target_x_table: Option<PyReadonlyArray1<f32>>,
+        target_pdf_table: Option<PyReadonlyArray1<f32>>,
+        proposal_x_table: Option<PyReadonlyArray1<f32>>,
+        proposal_pdf_table: Option<PyReadonlyArray1<f32>>,
+        target_threads: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let k = functions.len();
+        if k == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "At least one function is required",
+            ));
+        }
+
+        let dist_params_buffer = Self::parse_dist_params(dist_type, dist_params)?;
+
+        // Convert all table data
+        let x_table_data: Option<Vec<f32>> =
+            x_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let cdf_table_data: Option<Vec<f32>> =
+            cdf_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let target_x_data: Option<Vec<f32>> =
+            target_x_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let target_pdf_data: Option<Vec<f32>> =
+            target_pdf_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let proposal_x_data: Option<Vec<f32>> =
+            proposal_x_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let proposal_pdf_data: Option<Vec<f32>> =
+            proposal_pdf_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+
+        // Setup integration with PDF tables
+        let config = self
+            .engine
+            .setup_integration_with_pdf_tables(
+                n_samples,
+                k,
+                &dist_params_buffer,
+                x_table_data.as_deref(),
+                cdf_table_data.as_deref(),
+                target_x_data.as_deref(),
+                target_pdf_data.as_deref(),
+                proposal_x_data.as_deref(),
+                proposal_pdf_data.as_deref(),
+                seed,
+                target_threads,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to setup integration with PDF tables: {}",
+                    e
+                ))
+            })?;
+
+        // Get PDF table config for shader generation
+        let pdf_config = self.engine.get_pdf_table_config();
+
+        // Create shader config with PDF tables
+        let shader_config = IntegrationShaderConfigWithPdfTables {
+            user_functions: functions,
+            dist_type: Self::convert_dist_type(&dist_params_buffer),
+            workgroup_size: config.workgroup_size,
+            pdf_table_config: pdf_config,
+        };
+
+        // Generate shader
+        let shader_code =
+            generate_integration_shader_with_pdf_tables(&shader_config, config.loops_per_thread);
+
+        // Create pipeline with PDF tables
+        self.engine
+            .create_integration_pipeline_with_pdf_tables(&shader_code)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to create integration pipeline with PDF tables: {}",
+                    e
+                ))
+            })?;
+
+        // Execute
+        let thread_results = self
+            .engine
+            .execute_integration(config.workgroup_count)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Integration execution failed: {}",
+                    e
+                ))
+            })?;
+
+        // reduction
         let n_threads = thread_results.len() / k;
         let mut final_results = vec![0.0f32; k];
 

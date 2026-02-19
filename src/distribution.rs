@@ -12,6 +12,26 @@ pub enum DistributionType {
     Custom,
 }
 
+/// Configuration for PDF table functions
+#[derive(Debug, Clone)]
+pub struct PdfTableConfig {
+    pub has_target_pdf_table: bool,
+    pub has_proposal_pdf_table: bool,
+    pub target_table_size: u32,
+    pub proposal_table_size: u32,
+}
+
+impl Default for PdfTableConfig {
+    fn default() -> Self {
+        Self {
+            has_target_pdf_table: false,
+            has_proposal_pdf_table: false,
+            target_table_size: 0,
+            proposal_table_size: 0,
+        }
+    }
+}
+
 /// Generate the WGSL distribution library code
 pub fn generate_distribution_library() -> String {
     r#"// ========================================
@@ -116,8 +136,157 @@ fn sample_from_cdf_table(rng: f32, table_size: u32) -> f32 {
     let t = (rng - cdf_low) / (cdf_high - cdf_low);
     return mix(x_low, x_high, t);
 }
+
+// ========================================
+// PDF Lookup Functions for Importance Sampling
+// ========================================
+
+// PDF lookup helper macro for interleaved table
+// Interleaved format: [table_size, x0, pdf0, x1, pdf1, ..., xn, pdfn]
+// This function is NOT used directly - see pdf_target_from_table and pdf_proposal_from_table
 "#
     .to_string()
+}
+
+/// Generate WGSL code for PDF table wrapper functions
+/// Each wrapper directly accesses its own global buffer
+pub fn generate_pdf_table_functions(config: &PdfTableConfig) -> String {
+    let mut functions = String::new();
+
+    if config.has_target_pdf_table {
+        functions.push_str(&format!(
+            r#"
+// Target PDF from interleaved table
+// Format: [table_size, x0, pdf0, x1, pdf1, ...]
+fn pdf_target_from_table(x: f32) -> f32 {{
+    let table_size = u32(target_pdf_data[0u]);
+    
+    // Boundary check
+    let x_min = target_pdf_data[1u];
+    let x_max = target_pdf_data[1u + (table_size - 1u) * 2u];
+    if (x < x_min) || (x > x_max) {{
+        return 0.0;
+    }}
+    
+    // Binary search for x position
+    var low = 0u;
+    var high = table_size - 1u;
+    
+    for (var j = 0u; j < 16u; j++) {{
+        if (low >= high) {{ break; }}
+        let mid = (low + high) / 2u;
+        let x_mid = target_pdf_data[1u + mid * 2u];
+        if (x_mid < x) {{
+            low = mid + 1u;
+        }} else {{
+            high = mid;
+        }}
+    }}
+    
+    // Clamp to valid interpolation range
+    low = max(1u, low) - 1u;
+    low = min(low, table_size - 2u);
+    
+    // Linear interpolation
+    let x_low = target_pdf_data[1u + low * 2u];
+    let x_high = target_pdf_data[1u + (low + 1u) * 2u];
+    let pdf_low = target_pdf_data[2u + low * 2u];
+    let pdf_high = target_pdf_data[2u + (low + 1u) * 2u];
+    
+    let dx = x_high - x_low;
+    if (dx < 1.0e-10) {{
+        return pdf_low;
+    }}
+    
+    let t = (x - x_low) / dx;
+    return mix(pdf_low, pdf_high, t);
+}}
+"#
+        ));
+    }
+
+    if config.has_proposal_pdf_table {
+        functions.push_str(&format!(
+            r#"
+// Proposal PDF from interleaved table
+// Format: [table_size, x0, pdf0, x1, pdf1, ...]
+fn pdf_proposal_from_table(x: f32) -> f32 {{
+    let table_size = u32(proposal_pdf_data[0u]);
+    
+    // Boundary check
+    let x_min = proposal_pdf_data[1u];
+    let x_max = proposal_pdf_data[1u + (table_size - 1u) * 2u];
+    if (x < x_min) || (x > x_max) {{
+        return 0.0;
+    }}
+    
+    // Binary search for x position
+    var low = 0u;
+    var high = table_size - 1u;
+    
+    for (var j = 0u; j < 16u; j++) {{
+        if (low >= high) {{ break; }}
+        let mid = (low + high) / 2u;
+        let x_mid = proposal_pdf_data[1u + mid * 2u];
+        if (x_mid < x) {{
+            low = mid + 1u;
+        }} else {{
+            high = mid;
+        }}
+    }}
+    
+    // Clamp to valid interpolation range
+    low = max(1u, low) - 1u;
+    low = min(low, table_size - 2u);
+    
+    // Linear interpolation
+    let x_low = proposal_pdf_data[1u + low * 2u];
+    let x_high = proposal_pdf_data[1u + (low + 1u) * 2u];
+    let pdf_low = proposal_pdf_data[2u + low * 2u];
+    let pdf_high = proposal_pdf_data[2u + (low + 1u) * 2u];
+    
+    let dx = x_high - x_low;
+    if (dx < 1.0e-10) {{
+        return pdf_low;
+    }}
+    
+    let t = (x - x_low) / dx;
+    return mix(pdf_low, pdf_high, t);
+}}
+"#
+        ));
+    }
+
+    functions
+}
+
+/// Generate WGSL bind group declarations for PDF tables
+pub fn generate_pdf_table_bindings(config: &PdfTableConfig) -> String {
+    let mut bindings = String::new();
+    let mut binding_idx = 5u32;
+
+    if config.has_target_pdf_table {
+        let data_size = 1 + config.target_table_size * 2;
+        bindings.push_str(&format!(
+            r#"
+@group(0) @binding({binding_idx})
+var<storage, read> target_pdf_data: array<f32, {data_size}>;
+"#
+        ));
+        binding_idx += 1;
+    }
+
+    if config.has_proposal_pdf_table {
+        let data_size = 1 + config.proposal_table_size * 2;
+        bindings.push_str(&format!(
+            r#"
+@group(0) @binding({binding_idx})
+var<storage, read> proposal_pdf_data: array<f32, {data_size}>;
+"#
+        ));
+    }
+
+    bindings
 }
 
 /// Generate WGSL code for sampling from a specific distribution
