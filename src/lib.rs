@@ -7,95 +7,10 @@ mod shader_gen;
 
 use distribution::DistributionType;
 use engine::{ComputeEngine, DistributionParamsBuffer};
-use shader_gen::generate_compute_shader;
 use shader_gen::{
     generate_integration_shader, generate_integration_shader_with_pdf_tables,
     IntegrationShaderConfig, IntegrationShaderConfigWithPdfTables,
 };
-
-/// Monte Carlo Simulator (Path-Dependent Simulation)
-#[pyclass]
-struct MonteCarloSimulator {
-    engine: ComputeEngine,
-    user_function: Option<String>,
-}
-
-#[pymethods]
-impl MonteCarloSimulator {
-    #[new]
-    fn new() -> PyResult<Self> {
-        let engine = pollster::block_on(ComputeEngine::new()).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to initialize GPU: {}", e))
-        })?;
-
-        Ok(Self {
-            engine,
-            user_function: None,
-        })
-    }
-
-    fn set_user_function(&mut self, wgsl_code: &str) {
-        self.user_function = Some(wgsl_code.to_string());
-    }
-
-    fn run<'py>(
-        &mut self,
-        py: Python<'py>,
-        initial: PyReadonlyArray1<f32>,
-        iterations: u32,
-        seed: u32,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        let input_data = initial.as_slice().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to read input array: {}", e))
-        })?;
-
-        // Setup simulation
-        self.engine
-            .setup_simulation(input_data, iterations, seed)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to setup simulation: {}",
-                    e
-                ))
-            })?;
-
-        // Generate shader code
-        let shader_code = if let Some(ref user_fn) = self.user_function {
-            generate_compute_shader(user_fn, 64)
-        } else {
-            shader_gen::generate_simple_shader(64)
-        };
-
-        // Create compute pipeline
-        self.engine
-            .create_compute_pipeline(&shader_code)
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Failed to create compute pipeline: {}",
-                    e
-                ))
-            })?;
-
-        // Execute
-        let result = self.engine.execute().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Execution failed: {}", e))
-        })?;
-
-        Ok(result.to_pyarray(py))
-    }
-
-    fn run_with_function<'py>(
-        &mut self,
-        py: Python<'py>,
-        initial: PyReadonlyArray1<f32>,
-        iterations: u32,
-        seed: u32,
-        wgsl_function: &str,
-    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        self.set_user_function(wgsl_function);
-        self.run(py, initial, iterations, seed)
-    }
-}
 
 /// Monte Carlo Integrator for Expected Value Calculation
 /// Supports fusing multiple functions into a single GPU pass
@@ -444,7 +359,6 @@ impl MonteCarloIntegrator {
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<MonteCarloSimulator>()?;
     m.add_class::<MonteCarloIntegrator>()?;
     Ok(())
 }

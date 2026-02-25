@@ -165,7 +165,7 @@ uv run ruff format python/
 │   ├── distribution.rs      # WGSL distribution library
 │   └── shader_gen.rs       # Shader code generation
 ├── python/wgpu_montecarlo/ # Python package
-│   ├── __init__.py         # Public API (Integrator, Distribution, Simulator)
+│   ├── __init__.py         # Public API (Integrator, Distribution)
 │   └── transpiler.py       # Python AST → WGSL transpiler
 ├── tests/                   # Test suite
 │   ├── test_transpiler.py  # Transpiler unit tests (no GPU)

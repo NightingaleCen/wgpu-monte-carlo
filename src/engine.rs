@@ -3,15 +3,6 @@ use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 use wgpu::{Buffer, Device, Queue};
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-pub struct SimulationParams {
-    pub n: u32,          // Array length
-    pub iterations: u32, // Number of iterations
-    pub seed: u32,       // RNG seed
-    pub _padding: u32,   // Ensure 16-byte alignment
-}
-
 /// Parameters for Monte Carlo integration
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -58,7 +49,6 @@ pub struct ComputeEngine {
     queue: Arc<Queue>,
     params_buffer: Option<Buffer>,
     dist_params_buffer: Option<Buffer>,
-    input_buffer: Option<Buffer>,
     output_buffer: Option<Buffer>,
     staging_buffer: Option<Buffer>,
     lookup_table_buffer: Option<Buffer>,
@@ -100,7 +90,6 @@ impl ComputeEngine {
             queue: Arc::new(queue),
             params_buffer: None,
             dist_params_buffer: None,
-            input_buffer: None,
             output_buffer: None,
             staging_buffer: None,
             lookup_table_buffer: None,
@@ -114,231 +103,6 @@ impl ComputeEngine {
 
     pub fn set_workgroup_size(&mut self, size: u32) {
         self.workgroup_size = size;
-    }
-
-    pub fn setup_simulation(
-        &mut self,
-        input_data: &[f32],
-        iterations: u32,
-        seed: u32,
-    ) -> Result<()> {
-        let n = input_data.len() as u32;
-        let buffer_size = (input_data.len() * std::mem::size_of::<f32>()) as u64;
-
-        // Create simulation parameters buffer
-        let params = SimulationParams {
-            n,
-            iterations,
-            seed,
-            _padding: 0,
-        };
-
-        self.params_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Params Buffer"),
-            size: std::mem::size_of::<SimulationParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        }));
-
-        self.queue.write_buffer(
-            self.params_buffer.as_ref().unwrap(),
-            0,
-            bytemuck::cast_slice(&[params]),
-        );
-
-        // Create input buffer (read-only storage)
-        self.input_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Input Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        }));
-
-        self.queue.write_buffer(
-            self.input_buffer.as_ref().unwrap(),
-            0,
-            bytemuck::cast_slice(input_data),
-        );
-
-        // Create output buffer (read-write storage)
-        self.output_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        }));
-
-        // Create staging buffer for CPU readback
-        self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        }));
-
-        Ok(())
-    }
-
-    pub fn create_compute_pipeline(&mut self, shader_code: &str) -> Result<()> {
-        let shader_module = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Compute Shader"),
-                source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-            });
-
-        let bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Bind Group Layout"),
-                    entries: &[
-                        // Params (uniform)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // Input buffer (read-only storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // Output buffer (read-write storage)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::COMPUTE,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-
-        let pipeline_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Pipeline Layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        self.compute_pipeline = Some(self.device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("Compute Pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader_module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
-            },
-        ));
-
-        // Create bind group (only if buffers exist)
-        if self.params_buffer.is_some()
-            && self.input_buffer.is_some()
-            && self.output_buffer.is_some()
-        {
-            self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Bind Group"),
-                layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.params_buffer.as_ref().unwrap().as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.input_buffer.as_ref().unwrap().as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.output_buffer.as_ref().unwrap().as_entire_binding(),
-                    },
-                ],
-            }));
-        }
-
-        Ok(())
-    }
-
-    pub fn execute(&mut self) -> Result<Vec<f32>> {
-        let pipeline = self
-            .compute_pipeline
-            .as_ref()
-            .context("Pipeline not created")?;
-        let bind_group = self.bind_group.as_ref().context("Bind group not created")?;
-        let n = self
-            .input_buffer
-            .as_ref()
-            .map(|b| b.size() as u32 / 4)
-            .context("Input buffer not initialized")?;
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Compute Encoder"),
-            });
-
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Compute Pass"),
-                timestamp_writes: None,
-            });
-
-            compute_pass.set_pipeline(pipeline);
-            compute_pass.set_bind_group(0, bind_group, &[]);
-
-            let dispatch_count = (n + self.workgroup_size - 1) / self.workgroup_size;
-            compute_pass.dispatch_workgroups(dispatch_count, 1, 1);
-        }
-
-        // Copy output to staging buffer
-        encoder.copy_buffer_to_buffer(
-            self.output_buffer.as_ref().unwrap(),
-            0,
-            self.staging_buffer.as_ref().unwrap(),
-            0,
-            self.output_buffer.as_ref().unwrap().size(),
-        );
-
-        // Submit commands
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        // Read back results
-        let staging_buffer = self.staging_buffer.as_ref().unwrap();
-        let buffer_slice = staging_buffer.slice(..);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
-        });
-
-        self.device.poll(wgpu::Maintain::Wait);
-
-        rx.recv()
-            .context("Failed to receive map async result")?
-            .context("Failed to map buffer")?;
-
-        let data = buffer_slice.get_mapped_range();
-        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        staging_buffer.unmap();
-
-        Ok(result)
     }
 
     pub fn get_device(&self) -> &Device {
