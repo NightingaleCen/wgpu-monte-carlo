@@ -7,11 +7,23 @@ use wgpu::{Buffer, Device, Queue};
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct IntegrationParams {
-    pub n_threads: u32,        // Number of GPU threads to launch
-    pub loops_per_thread: u32, // Samples per thread
-    pub seed: u32,             // RNG seed
-    pub k_functions: u32,      // Number of functions being integrated
-    pub _padding: u32,         // Ensure 16-byte alignment
+    pub n_threads: u32,
+    pub loops_per_thread: u32,
+    pub seed: u32,
+    pub k_functions: u32,
+    pub _padding: u32,
+}
+
+/// Parameters for MCMC (Markov Chain Monte Carlo)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct McmcParams {
+    pub n_chains: u32,
+    pub n_steps: u32,
+    pub n_burnin: u32,
+    pub seed: u32,
+    pub k_functions: u32,
+    pub _padding: u32,
 }
 
 /// Parameters for probability distributions
@@ -44,6 +56,17 @@ pub struct PdfTableBuffers {
     pub proposal_size: u32,
 }
 
+/// Configuration for log-PDF tables in MCMC
+#[derive(Debug, Default)]
+pub struct MhLogPdfBuffers {
+    pub target_log_pdf_buffer: Option<Buffer>,
+    pub proposal_log_pdf_buffer: Option<Buffer>,
+    pub has_target: bool,
+    pub has_proposal: bool,
+    pub target_size: u32,
+    pub proposal_size: u32,
+}
+
 pub struct ComputeEngine {
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -58,6 +81,10 @@ pub struct ComputeEngine {
     workgroup_size: u32,
     // PDF table buffers for importance sampling
     pdf_buffers: PdfTableBuffers,
+    // Log-PDF table buffers for MCMC (MH algorithm)
+    mcmc_log_pdf_buffers: MhLogPdfBuffers,
+    // Second distribution params buffer for MCMC (target distribution)
+    target_dist_params_buffer: Option<Buffer>,
 }
 
 impl ComputeEngine {
@@ -98,6 +125,8 @@ impl ComputeEngine {
             bind_group: None,
             workgroup_size: 64,
             pdf_buffers: PdfTableBuffers::default(),
+            mcmc_log_pdf_buffers: MhLogPdfBuffers::default(),
+            target_dist_params_buffer: None,
         })
     }
 
@@ -528,7 +557,8 @@ impl ComputeEngine {
             mapped_at_creation: false,
         });
 
-        self.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&data));
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::cast_slice(&data));
 
         Ok(buffer)
     }
@@ -773,6 +803,433 @@ impl ComputeEngine {
 
         self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Integration IS Bind Group"),
+            layout: &bind_group_layout,
+            entries: &bind_entries,
+        }));
+
+        Ok(())
+    }
+
+    // ========================================
+    // MCMC (Markov Chain Monte Carlo) Methods
+    // ========================================
+
+    /// Calculate dispatch configuration for MCMC
+    ///
+    /// For MCMC, n_chains directly determines the number of GPU threads.
+    /// Each chain runs independently with its own state.
+    pub fn calculate_mcmc_dispatch_config(&self, n_chains: u32) -> DispatchConfig {
+        let workgroup_size: u32 = 256;
+        let workgroup_count = (n_chains + workgroup_size - 1) / workgroup_size;
+        let total_threads = workgroup_count * workgroup_size;
+
+        DispatchConfig {
+            workgroup_size,
+            workgroup_count,
+            loops_per_thread: 1, // Not used for MCMC
+            total_threads,
+        }
+    }
+
+    /// Setup MCMC buffers and parameters
+    ///
+    /// Creates all necessary GPU buffers for MCMC:
+    /// - McmcParams uniform buffer
+    /// - Proposal distribution params (for sampling)
+    /// - Target distribution params
+    /// - CDF tables for proposal sampling
+    /// - Log-PDF tables for both distributions
+    pub fn setup_mcmc(
+        &mut self,
+        n_steps: u32,
+        n_chains: u32,
+        n_burnin: u32,
+        k_functions: usize,
+        proposal_dist_params: &DistributionParamsBuffer,
+        target_dist_params: &DistributionParamsBuffer,
+        x_table: Option<&[f32]>,
+        cdf_table: Option<&[f32]>,
+        target_x_table: Option<&[f32]>,
+        target_log_pdf_table: Option<&[f32]>,
+        proposal_x_table: Option<&[f32]>,
+        proposal_log_pdf_table: Option<&[f32]>,
+        seed: u32,
+        target_threads: Option<u32>,
+    ) -> Result<DispatchConfig> {
+        // Use n_chains directly, or target_threads if specified
+        let actual_chains = target_threads.unwrap_or(n_chains);
+        let config = self.calculate_mcmc_dispatch_config(actual_chains);
+
+        // Create MCMC params uniform buffer
+        let mcmc_params = McmcParams {
+            n_chains: config.total_threads,
+            n_steps,
+            n_burnin,
+            seed,
+            k_functions: k_functions as u32,
+            _padding: 0,
+        };
+
+        self.params_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MCMC Params Buffer"),
+            size: std::mem::size_of::<McmcParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
+        self.queue.write_buffer(
+            self.params_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[mcmc_params]),
+        );
+
+        // Create proposal distribution params buffer
+        self.dist_params_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Proposal Dist Params Buffer"),
+            size: std::mem::size_of::<DistributionParamsBuffer>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
+        self.queue.write_buffer(
+            self.dist_params_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[*proposal_dist_params]),
+        );
+
+        // Create target distribution params buffer
+        self.target_dist_params_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Target Dist Params Buffer"),
+            size: std::mem::size_of::<DistributionParamsBuffer>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
+        self.queue.write_buffer(
+            self.target_dist_params_buffer.as_ref().unwrap(),
+            0,
+            bytemuck::cast_slice(&[*target_dist_params]),
+        );
+
+        // Create CDF tables for proposal distribution
+        if let Some(table_data) = cdf_table {
+            self.lookup_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("MCMC CDF Table Buffer"),
+                size: (table_data.len() * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+            self.queue.write_buffer(
+                self.lookup_table_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(table_data),
+            );
+        } else {
+            self.lookup_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Dummy MCMC CDF Table Buffer"),
+                size: std::mem::size_of::<f32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+            self.queue.write_buffer(
+                self.lookup_table_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&[0.0f32]),
+            );
+        }
+
+        // Create x_table for proposal distribution
+        if let Some(x_data) = x_table {
+            self.x_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("MCMC X Table Buffer"),
+                size: (x_data.len() * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+            self.queue.write_buffer(
+                self.x_table_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(x_data),
+            );
+        } else {
+            self.x_table_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Dummy MCMC X Table Buffer"),
+                size: std::mem::size_of::<f32>() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+            self.queue.write_buffer(
+                self.x_table_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&[0.0f32]),
+            );
+        }
+
+        // Create log-PDF tables for target distribution
+        if let (Some(x_tbl), Some(log_pdf_tbl)) = (target_x_table, target_log_pdf_table) {
+            self.mcmc_log_pdf_buffers.target_log_pdf_buffer = Some(
+                self.create_interleaved_pdf_buffer(x_tbl, log_pdf_tbl, "Target Log-PDF Table")?,
+            );
+            self.mcmc_log_pdf_buffers.has_target = true;
+            self.mcmc_log_pdf_buffers.target_size = x_tbl.len() as u32;
+        }
+
+        // Create log-PDF tables for proposal distribution
+        if let (Some(x_tbl), Some(log_pdf_tbl)) = (proposal_x_table, proposal_log_pdf_table) {
+            self.mcmc_log_pdf_buffers.proposal_log_pdf_buffer = Some(
+                self.create_interleaved_pdf_buffer(x_tbl, log_pdf_tbl, "Proposal Log-PDF Table")?,
+            );
+            self.mcmc_log_pdf_buffers.has_proposal = true;
+            self.mcmc_log_pdf_buffers.proposal_size = x_tbl.len() as u32;
+        }
+
+        // Output buffer: size = total_chains * k_functions
+        let output_size =
+            (config.total_threads as usize * k_functions * std::mem::size_of::<f32>()) as u64;
+        self.output_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MCMC Output Buffer"),
+            size: output_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+
+        // Staging buffer for CPU readback
+        self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MCMC Staging Buffer"),
+            size: output_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
+        Ok(config)
+    }
+
+    /// Get MCMC log-PDF table configuration for shader generation
+    pub fn get_mcmc_log_pdf_config(&self) -> crate::distribution::MhLogPdfConfig {
+        crate::distribution::MhLogPdfConfig {
+            has_target_log_pdf_table: self.mcmc_log_pdf_buffers.has_target,
+            has_proposal_log_pdf_table: self.mcmc_log_pdf_buffers.has_proposal,
+            target_table_size: self.mcmc_log_pdf_buffers.target_size,
+            proposal_table_size: self.mcmc_log_pdf_buffers.proposal_size,
+        }
+    }
+
+    /// Create compute pipeline for MCMC
+    pub fn create_mcmc_pipeline(&mut self, shader_code: &str) -> Result<()> {
+        let shader_module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("MCMC Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(shader_code.into()),
+            });
+
+        // Build bind group layout entries for MCMC
+        // binding 0: McmcParams (uniform)
+        // binding 1: Proposal dist params (uniform)
+        // binding 2: Target dist params (uniform)
+        // binding 3: CDF table (storage, read-only)
+        // binding 4: X table (storage, read-only)
+        // binding 5: Output buffer (storage, read-write)
+        // binding 6+: Log-PDF tables
+        let mut entries = vec![
+            // McmcParams - binding 0
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Proposal dist params - binding 1
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Target dist params - binding 2
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // CDF table - binding 3
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // X table - binding 4
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // Output buffer - binding 5
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ];
+
+        let mut next_binding = 6u32;
+
+        // Add target log-PDF table binding
+        if self.mcmc_log_pdf_buffers.has_target {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: next_binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+            next_binding += 1;
+        }
+
+        // Add proposal log-PDF table binding
+        if self.mcmc_log_pdf_buffers.has_proposal {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: next_binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
+
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("MCMC Bind Group Layout"),
+                    entries: &entries,
+                });
+
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("MCMC Pipeline Layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        self.compute_pipeline = Some(self.device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("MCMC Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            },
+        ));
+
+        // Build bind group entries
+        let mut bind_entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.params_buffer.as_ref().unwrap().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: self
+                    .dist_params_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: self
+                    .target_dist_params_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: self
+                    .lookup_table_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: self.x_table_buffer.as_ref().unwrap().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: self.output_buffer.as_ref().unwrap().as_entire_binding(),
+            },
+        ];
+
+        let mut next_binding = 6u32;
+
+        if self.mcmc_log_pdf_buffers.has_target {
+            bind_entries.push(wgpu::BindGroupEntry {
+                binding: next_binding,
+                resource: self
+                    .mcmc_log_pdf_buffers
+                    .target_log_pdf_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            });
+            next_binding += 1;
+        }
+
+        if self.mcmc_log_pdf_buffers.has_proposal {
+            bind_entries.push(wgpu::BindGroupEntry {
+                binding: next_binding,
+                resource: self
+                    .mcmc_log_pdf_buffers
+                    .proposal_log_pdf_buffer
+                    .as_ref()
+                    .unwrap()
+                    .as_entire_binding(),
+            });
+        }
+
+        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MCMC Bind Group"),
             layout: &bind_group_layout,
             entries: &bind_entries,
         }));

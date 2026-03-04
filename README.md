@@ -7,6 +7,7 @@ GPU-accelerated Monte Carlo integration using WebGPU (wgpu) and PyO3. Calculate 
 - **GPU Acceleration**: WebGPU compute for massive parallel execution
 - **Multi-Function Fusion**: Evaluate K functions on same samples in one GPU pass
 - **Importance Sampling**: Efficient estimation for rare events using proposal distributions
+- **MCMC**: Metropolis-Hastings algorithm for sampling from arbitrary distributions
 - **Pythonic API**: Write Python functions, auto-transpiled to WGSL shaders
 - **Native Distributions**: Uniform, Normal (Box-Muller), Exponential (analytical sampling)
 - **Custom Distributions**: Define any distribution via PDF function or pre-computed tables
@@ -109,6 +110,51 @@ print(f"E_p[X] = {result.values[0]:.6f}")   # ~0.0
 print(f"E_p[X²] = {result.values[1]:.6f}")  # ~1.0
 ```
 
+### MCMC (Metropolis-Hastings)
+
+Sample from arbitrary distributions using Markov Chain Monte Carlo:
+
+```python
+from wgpu_montecarlo import MonteCarloIntegrator, Distribution
+
+integrator = MonteCarloIntegrator()
+
+# Target distribution to sample from
+target = Distribution.normal(0.0, 1.0)
+
+# Proposal distribution for MH steps (can be different from target)
+proposal = Distribution.normal(0.0, 2.0)
+
+# Run MCMC with parallel chains
+result = integrator.integrate_mcmc(
+    [lambda x: x, lambda x: x**2],
+    target,
+    proposal,
+    n_steps=10000,    # Samples per chain after burn-in
+    n_chains=256,     # Parallel chains (GPU threads)
+    n_burnin=1000,    # Initial steps to discard
+)
+
+print(f"E[X]  = {result.values[0]:+.6f}")  # ~0.0
+print(f"E[X²] = {result.values[1]:.6f}")  # ~1.0
+```
+
+MCMC works with any combination of:
+- **Analytical distributions**: Normal, Uniform, Exponential
+- **Custom distributions**: From PDF function or table
+
+```python
+# Custom target distribution
+def my_pdf(x):
+    return 0.5 * x if 0 <= x <= 2 else 0  # Triangular on [0, 2]
+
+target = Distribution.from_pdf(my_pdf, support=(0.0, 2.0))
+proposal = Distribution.uniform(0.0, 2.0)
+
+result = integrator.integrate_mcmc([lambda x: x], target, proposal, n_steps=5000)
+```
+```
+
 
 #### Supported PDF Types
 
@@ -188,6 +234,9 @@ uv run pytest tests/ -v
 
 # Run importance sampling tests
 uv run pytest tests/test_importance_sampling.py -v
+
+# Run MCMC tests
+uv run pytest tests/test_mcmc.py -v
 ```
 
 ## Project Structure
@@ -203,7 +252,8 @@ uv run pytest tests/test_importance_sampling.py -v
 │   └── shader_gen.rs        # Shader generation
 ├── examples/                # Example scripts
 │   ├── integration_demo.py  # Basic integration
-│   └── importance_sampling_demo.py  # IS example
+│   ├── importance_sampling_demo.py  # IS example
+│   └── mcmc_demo.py        # MCMC example
 └── tests/
 ```
 

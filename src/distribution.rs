@@ -32,6 +32,26 @@ impl Default for PdfTableConfig {
     }
 }
 
+/// Configuration for MH algorithm log-PDF table functions
+#[derive(Debug, Clone)]
+pub struct MhLogPdfConfig {
+    pub has_target_log_pdf_table: bool,
+    pub has_proposal_log_pdf_table: bool,
+    pub target_table_size: u32,
+    pub proposal_table_size: u32,
+}
+
+impl Default for MhLogPdfConfig {
+    fn default() -> Self {
+        Self {
+            has_target_log_pdf_table: false,
+            has_proposal_log_pdf_table: false,
+            target_table_size: 0,
+            proposal_table_size: 0,
+        }
+    }
+}
+
 /// Generate the WGSL distribution library code
 pub fn generate_distribution_library() -> String {
     r#"// ========================================
@@ -312,6 +332,146 @@ pub fn generate_rng_code(dist_type: DistributionType) -> String {
         DistributionType::Normal => "".to_string(),
         _ => "let rng = random_uniform(params.seed, idx, i);".to_string(),
     }
+}
+
+/// Generate WGSL bind group declarations for MCMC log-PDF tables
+pub fn generate_mcmc_log_pdf_bindings(config: &MhLogPdfConfig) -> String {
+    let mut bindings = String::new();
+    let mut binding_idx = 6u32;
+
+    if config.has_target_log_pdf_table {
+        let data_size = 1 + config.target_table_size * 2;
+        bindings.push_str(&format!(
+            r#"
+@group(0) @binding({binding_idx})
+var<storage, read> target_log_pdf_data: array<f32, {data_size}>;
+"#
+        ));
+        binding_idx += 1;
+    }
+
+    if config.has_proposal_log_pdf_table {
+        let data_size = 1 + config.proposal_table_size * 2;
+        bindings.push_str(&format!(
+            r#"
+@group(0) @binding({binding_idx})
+var<storage, read> proposal_log_pdf_data: array<f32, {data_size}>;
+"#
+        ));
+    }
+
+    bindings
+}
+
+/// Generate WGSL code for MCMC log-PDF lookup functions
+pub fn generate_mcmc_log_pdf_functions(config: &MhLogPdfConfig) -> String {
+    let mut functions = String::new();
+
+    if config.has_target_log_pdf_table {
+        functions.push_str(&format!(
+            r#"
+// Target log-PDF from interleaved table
+// Format: [table_size, x0, log_pdf0, x1, log_pdf1, ...]
+fn log_pdf_target_from_table(x: f32) -> f32 {{
+    let table_size = u32(target_log_pdf_data[0u]);
+    
+    // Boundary check
+    let x_min = target_log_pdf_data[1u];
+    let x_max = target_log_pdf_data[1u + (table_size - 1u) * 2u];
+    if (x < x_min) || (x > x_max) {{
+        return -100.0;  // Very low log-probability outside support
+    }}
+    
+    // Binary search for x position
+    var low = 0u;
+    var high = table_size - 1u;
+    
+    for (var j = 0u; j < 16u; j++) {{
+        if (low >= high) {{ break; }}
+        let mid = (low + high) / 2u;
+        let x_mid = target_log_pdf_data[1u + mid * 2u];
+        if (x_mid < x) {{
+            low = mid + 1u;
+        }} else {{
+            high = mid;
+        }}
+    }}
+    
+    // Clamp to valid interpolation range
+    low = max(1u, low) - 1u;
+    low = min(low, table_size - 2u);
+    
+    // Linear interpolation
+    let x_low = target_log_pdf_data[1u + low * 2u];
+    let x_high = target_log_pdf_data[1u + (low + 1u) * 2u];
+    let log_pdf_low = target_log_pdf_data[2u + low * 2u];
+    let log_pdf_high = target_log_pdf_data[2u + (low + 1u) * 2u];
+    
+    let dx = x_high - x_low;
+    if (dx < 1.0e-10) {{
+        return log_pdf_low;
+    }}
+    
+    let t = (x - x_low) / dx;
+    return mix(log_pdf_low, log_pdf_high, t);
+}}
+"#
+        ));
+    }
+
+    if config.has_proposal_log_pdf_table {
+        functions.push_str(&format!(
+            r#"
+// Proposal log-PDF from interleaved table
+// Format: [table_size, x0, log_pdf0, x1, log_pdf1, ...]
+fn log_pdf_proposal_from_table(x: f32) -> f32 {{
+    let table_size = u32(proposal_log_pdf_data[0u]);
+    
+    // Boundary check
+    let x_min = proposal_log_pdf_data[1u];
+    let x_max = proposal_log_pdf_data[1u + (table_size - 1u) * 2u];
+    if (x < x_min) || (x > x_max) {{
+        return -100.0;  // Very low log-probability outside support
+    }}
+    
+    // Binary search for x position
+    var low = 0u;
+    var high = table_size - 1u;
+    
+    for (var j = 0u; j < 16u; j++) {{
+        if (low >= high) {{ break; }}
+        let mid = (low + high) / 2u;
+        let x_mid = proposal_log_pdf_data[1u + mid * 2u];
+        if (x_mid < x) {{
+            low = mid + 1u;
+        }} else {{
+            high = mid;
+        }}
+    }}
+    
+    // Clamp to valid interpolation range
+    low = max(1u, low) - 1u;
+    low = min(low, table_size - 2u);
+    
+    // Linear interpolation
+    let x_low = proposal_log_pdf_data[1u + low * 2u];
+    let x_high = proposal_log_pdf_data[1u + (low + 1u) * 2u];
+    let log_pdf_low = proposal_log_pdf_data[2u + low * 2u];
+    let log_pdf_high = proposal_log_pdf_data[2u + (low + 1u) * 2u];
+    
+    let dx = x_high - x_low;
+    if (dx < 1.0e-10) {{
+        return log_pdf_low;
+    }}
+    
+    let t = (x - x_low) / dx;
+    return mix(log_pdf_low, log_pdf_high, t);
+}}
+"#
+        ));
+    }
+
+    functions
 }
 
 #[cfg(test)]

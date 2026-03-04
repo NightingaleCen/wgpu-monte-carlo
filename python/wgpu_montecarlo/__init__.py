@@ -67,6 +67,7 @@ __all__ = [
     "TranspilerError",
     "integrate",
     "integrate_importance_sampling",
+    "integrate_mcmc",
 ]
 
 
@@ -318,7 +319,7 @@ class Distribution:
 
         return Distribution(
             dist_type=DistributionType.UNIFORM,
-            params={"min": min, "max": max},
+            params={"min": min, "max": max, "support": (min, max)},
             pdf_func=pdf,
         )
 
@@ -345,9 +346,14 @@ class Distribution:
             z = (x - mean) / sigma
             return np.exp(-0.5 * z * z) / (sigma * sqrt_2pi)
 
+        # we restrict the support to 7 standard deviations around the mean
         return Distribution(
             dist_type=DistributionType.NORMAL,
-            params={"mean": mean, "std": std},
+            params={
+                "mean": mean,
+                "std": std,
+                "support": (mean - 7 * std, mean + 7 * std),
+            },
             pdf_func=pdf,
         )
 
@@ -370,7 +376,7 @@ class Distribution:
 
         return Distribution(
             dist_type=DistributionType.EXPONENTIAL,
-            params={"lambda": lambda_param},
+            params={"lambda": lambda_param, "support": (0.0, 10.0 / lambda_param)},
             pdf_func=pdf,
         )
 
@@ -562,6 +568,44 @@ class Distribution:
             [self._pdf_func(float(x)) for x in self._x_table], dtype=np.float32
         )
         return self._x_table, self._pdf_table
+
+    def get_log_pdf_table(
+        self, min_log_value: float = -100.0
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (x_table, log_pdf_table) for MCMC algorithms.
+
+        Converts PDF values to log-space for numerical stability in
+        Metropolis-Hastings acceptance ratio calculations.
+
+        Args:
+            min_log_value: Minimum log value to use for PDF=0 or near-zero values.
+        Returns:
+            Tuple of (x_table, log_pdf_table) as numpy float32 arrays
+
+        Note:
+            For PDF values that are zero or negative, the log_pdf is set to
+            min_log_value to avoid -inf and maintain numerical stability.
+        """
+        x_table, pdf_table = self.get_or_compute_pdf_table()
+
+        # For PDF <= 0, use min_log_value instead of -inf
+        log_pdf_table = np.where(
+            pdf_table > 0,
+            np.log(np.maximum(pdf_table, 1e-16)),
+            min_log_value,
+        ).astype(np.float32)
+
+        # For uniform distributions, ensure the endpoint has the correct log-PDF
+        # The uniform PDF is 1/width inside [min, max), but our table includes x=max
+        # which has PDF=0 due to the half-open interval. Fix by setting the last
+        # point to have the same log-PDF as the interior points.
+        if self.dist_type == DistributionType.UNIFORM:
+            width = self.params.get("max", 1.0) - self.params.get("min", 0.0)
+            if width > 0:
+                log_pdf_val = np.log(1.0 / width)
+                log_pdf_table[-1] = log_pdf_val
+
+        return x_table, log_pdf_table
 
 
 class IntegrationResult:
@@ -968,6 +1012,113 @@ fn {wrapper_name}(x: f32) -> f32 {{
             n_functions=len(functions),
         )
 
+    def integrate_mcmc(
+        self,
+        functions: List[Union[Callable, str]],
+        target_distribution: Distribution,
+        proposal_distribution: Distribution,
+        n_steps: int = 10_000,
+        n_chains: int = 1024,
+        n_burnin: int = 1_000,
+        seed: int = 42,
+    ) -> IntegrationResult:
+        """Compute E[f(X)] using Metropolis-Hastings algorithm.
+
+        Runs multiple independent Markov chains in parallel on the GPU,
+        with each chain performing burn-in before collecting samples.
+
+        Args:
+            functions: List of Python callables or WGSL code strings.
+            target_distribution: Target distribution p(x) to sample from.
+            proposal_distribution: Proposal distribution q(x'|x) for MH steps.
+                For symmetric proposals (e.g., Normal), the MH ratio simplifies.
+            n_steps: Number of sampling steps per chain (after burn-in).
+            n_chains: Number of parallel MCMC chains (GPU threads).
+                Total number of samples = n_chains * n_steps.
+            n_burnin: Number of burn-in steps per chain (discarded).
+            seed: Random seed.
+
+        Returns:
+            IntegrationResult containing E_p[f_i(X)] values.
+
+        Example:
+            >>> integrator = MonteCarloIntegrator()
+            >>> target = Distribution.normal(0.0, 1.0)
+            >>> proposal = Distribution.normal(0.0, 2.0)  # Wider proposal
+            >>> result = integrator.integrate_mcmc(
+            ...     [lambda x: x, lambda x: x**2],
+            ...     target, proposal,
+            ...     n_steps=10000, n_chains=1024, n_burnin=1000
+            ... )
+        """
+        if len(functions) == 0:
+            raise ValueError("At least one function is required")
+
+        if n_steps <= 0:
+            raise ValueError("n_steps must be positive")
+        if n_chains <= 0:
+            raise ValueError("n_chains must be positive")
+        if n_burnin < 0:
+            raise ValueError("n_burnin must be non-negative")
+
+        # Transpile functions to WGSL
+        wgsl_functions = []
+        for func in functions:
+            if callable(func):
+                wgsl_code = transpile_function(func)
+                wgsl_functions.append(wgsl_code)
+            elif isinstance(func, str):
+                wgsl_functions.append(func)
+            else:
+                raise TypeError(
+                    f"Function must be callable or WGSL string, got {type(func)}"
+                )
+
+        # Get log-PDF tables for target and proposal distributions
+        target_x_table, target_log_pdf_table = target_distribution.get_log_pdf_table()
+        proposal_x_table, proposal_log_pdf_table = (
+            proposal_distribution.get_log_pdf_table()
+        )
+
+        # Prepare CDF tables for proposal distribution (for sampling)
+        x_table = None
+        cdf_table = None
+        if proposal_distribution.dist_type == DistributionType.CUSTOM:
+            if proposal_distribution._x_table is not None:
+                x_table = proposal_distribution._x_table
+            if proposal_distribution._cdf_table is not None:
+                cdf_table = proposal_distribution._cdf_table
+
+        proposal_dist_type_str = proposal_distribution.dist_type.name.lower()
+        target_dist_type_str = target_distribution.dist_type.name.lower()
+
+        # Call Rust backend
+        values = self._integrator.integrate_mcmc(
+            wgsl_functions,
+            proposal_dist_type_str,
+            proposal_distribution.params,
+            target_dist_type_str,
+            target_distribution.params,
+            n_steps,
+            n_chains,
+            n_burnin,
+            seed,
+            x_table,
+            cdf_table,
+            target_x_table,
+            target_log_pdf_table,
+            proposal_x_table,
+            proposal_log_pdf_table,
+            self._target_threads,
+        )
+
+        total_samples = n_chains * n_steps
+        return IntegrationResult(
+            values=values,
+            n_samples=total_samples,
+            n_functions=len(functions),
+        )
+
 
 def _rename_wgsl_function(wgsl_code: str, new_name: str) -> str:
     """Helper function to rename a WGSL function definition.
@@ -1060,4 +1211,56 @@ def integrate_importance_sampling(
     integrator = MonteCarloIntegrator(target_threads=target_threads)
     return integrator.integrate_importance_sampling(
         functions, target_distribution, proposal_distribution, n_samples, seed
+    )
+
+
+def integrate_mcmc(
+    functions: List[Union[Callable, str]],
+    target_distribution: Distribution,
+    proposal_distribution: Distribution,
+    n_steps: int = 10_000,
+    n_chains: int = 1024,
+    n_burnin: int = 1_000,
+    seed: int = 42,
+    target_threads: Optional[int] = None,
+) -> IntegrationResult:
+    """Convenience function for MCMC integration.
+
+    This is a shorthand for creating a MonteCarloIntegrator and calling
+    integrate_mcmc().
+
+    Args:
+        functions: List of Python callables or WGSL code strings.
+        target_distribution: Target distribution p(x) to sample from.
+        proposal_distribution: Proposal distribution q(x'|x) for MH steps.
+        n_steps: Number of sampling steps per chain (after burn-in).
+        n_chains: Number of parallel MCMC chains.
+        n_burnin: Number of burn-in steps per chain.
+        seed: Random seed.
+        target_threads: Optional override for GPU threads (ignored, uses n_chains).
+
+    Returns:
+        IntegrationResult containing E_p[f_i(X)] values.
+
+    Example:
+        >>> from wgpu_montecarlo import integrate_mcmc, Distribution
+        >>>
+        >>> target = Distribution.normal(0.0, 1.0)
+        >>> proposal = Distribution.normal(0.0, 2.0)
+        >>> result = integrate_mcmc(
+        ...     [lambda x: x, lambda x: x**2],
+        ...     target, proposal,
+        ...     n_steps=10000, n_chains=1024
+        ... )
+        >>> print(f"E_p[X] = {result[0]:.6f}")
+    """
+    integrator = MonteCarloIntegrator(target_threads=target_threads)
+    return integrator.integrate_mcmc(
+        functions,
+        target_distribution,
+        proposal_distribution,
+        n_steps,
+        n_chains,
+        n_burnin,
+        seed,
     )

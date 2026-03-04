@@ -8,8 +8,8 @@ mod shader_gen;
 use distribution::DistributionType;
 use engine::{ComputeEngine, DistributionParamsBuffer};
 use shader_gen::{
-    generate_integration_shader, generate_integration_shader_with_pdf_tables,
-    IntegrationShaderConfig, IntegrationShaderConfigWithPdfTables,
+    generate_integration_shader, generate_integration_shader_with_pdf_tables, generate_mcmc_shader,
+    IntegrationShaderConfig, IntegrationShaderConfigWithPdfTables, McmcShaderConfig,
 };
 
 /// Monte Carlo Integrator for Expected Value Calculation
@@ -261,6 +261,162 @@ impl MonteCarloIntegrator {
             })?;
 
         // reduction
+        let n_threads = thread_results.len() / k;
+        let mut final_results = vec![0.0f32; k];
+
+        for func_idx in 0..k {
+            let sum: f32 = (0..n_threads)
+                .map(|thread_idx| thread_results[thread_idx * k + func_idx])
+                .sum();
+            final_results[func_idx] = sum / n_threads as f32;
+        }
+
+        Ok(final_results.to_pyarray(py))
+    }
+
+    /// MCMC integration using Metropolis-Hastings algorithm
+    ///
+    /// Args:
+    ///     functions: List of WGSL function code strings
+    ///     proposal_dist_type: Proposal distribution type for sampling
+    ///     proposal_dist_params: Proposal distribution parameters
+    ///     target_dist_type: Target distribution type for acceptance ratio
+    ///     target_dist_params: Target distribution parameters
+    ///     n_steps: Number of sampling steps per chain (after burn-in)
+    ///     n_chains: Number of parallel MCMC chains
+    ///     n_burnin: Number of burn-in steps per chain
+    ///     seed: Random seed
+    ///     x_table: Optional x values for proposal CDF table
+    ///     cdf_table: Optional CDF values for proposal distribution
+    ///     target_x_table: Optional x values for target log-PDF table
+    ///     target_log_pdf_table: Optional target log-PDF values
+    ///     proposal_x_table: Optional x values for proposal log-PDF table
+    ///     proposal_log_pdf_table: Optional proposal log-PDF values
+    ///     target_threads: Optional override for number of chains
+    #[pyo3(signature = (
+        functions, proposal_dist_type, proposal_dist_params,
+        target_dist_type, target_dist_params,
+        n_steps, n_chains, n_burnin, seed,
+        x_table=None, cdf_table=None,
+        target_x_table=None, target_log_pdf_table=None,
+        proposal_x_table=None, proposal_log_pdf_table=None,
+        target_threads=None
+    ))]
+    fn integrate_mcmc<'py>(
+        &mut self,
+        py: Python<'py>,
+        functions: Vec<String>,
+        proposal_dist_type: &str,
+        proposal_dist_params: &Bound<'_, pyo3::types::PyDict>,
+        target_dist_type: &str,
+        target_dist_params: &Bound<'_, pyo3::types::PyDict>,
+        n_steps: u32,
+        n_chains: u32,
+        n_burnin: u32,
+        seed: u32,
+        x_table: Option<PyReadonlyArray1<f32>>,
+        cdf_table: Option<PyReadonlyArray1<f32>>,
+        target_x_table: Option<PyReadonlyArray1<f32>>,
+        target_log_pdf_table: Option<PyReadonlyArray1<f32>>,
+        proposal_x_table: Option<PyReadonlyArray1<f32>>,
+        proposal_log_pdf_table: Option<PyReadonlyArray1<f32>>,
+        target_threads: Option<u32>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let k = functions.len();
+        if k == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "At least one function is required",
+            ));
+        }
+
+        if n_steps == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "n_steps must be positive",
+            ));
+        }
+
+        if n_chains == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "n_chains must be positive",
+            ));
+        }
+
+        // Parse distribution parameters
+        let proposal_params_buffer =
+            Self::parse_dist_params(proposal_dist_type, proposal_dist_params)?;
+        let target_params_buffer = Self::parse_dist_params(target_dist_type, target_dist_params)?;
+
+        // Convert table data
+        let x_table_data: Option<Vec<f32>> =
+            x_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let cdf_table_data: Option<Vec<f32>> =
+            cdf_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let target_x_data: Option<Vec<f32>> =
+            target_x_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let target_log_pdf_data: Option<Vec<f32>> =
+            target_log_pdf_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let proposal_x_data: Option<Vec<f32>> =
+            proposal_x_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+        let proposal_log_pdf_data: Option<Vec<f32>> =
+            proposal_log_pdf_table.map(|arr| arr.as_slice().unwrap_or(&[]).to_vec());
+
+        // Setup MCMC
+        let config = self
+            .engine
+            .setup_mcmc(
+                n_steps,
+                n_chains,
+                n_burnin,
+                k,
+                &proposal_params_buffer,
+                &target_params_buffer,
+                x_table_data.as_deref(),
+                cdf_table_data.as_deref(),
+                target_x_data.as_deref(),
+                target_log_pdf_data.as_deref(),
+                proposal_x_data.as_deref(),
+                proposal_log_pdf_data.as_deref(),
+                seed,
+                target_threads,
+            )
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to setup MCMC: {}", e))
+            })?;
+
+        // Get log-PDF config for shader generation
+        let log_pdf_config = self.engine.get_mcmc_log_pdf_config();
+
+        // Create shader config
+        let shader_config = McmcShaderConfig {
+            user_functions: functions,
+            proposal_dist_type: Self::convert_dist_type(&proposal_params_buffer),
+            target_dist_type: Self::convert_dist_type(&target_params_buffer),
+            workgroup_size: config.workgroup_size,
+            log_pdf_config,
+        };
+
+        // Generate shader
+        let shader_code = generate_mcmc_shader(&shader_config);
+
+        // Create pipeline
+        self.engine
+            .create_mcmc_pipeline(&shader_code)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to create MCMC pipeline: {}",
+                    e
+                ))
+            })?;
+
+        // Execute
+        let thread_results = self
+            .engine
+            .execute_integration(config.workgroup_count)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("MCMC execution failed: {}", e))
+            })?;
+
+        // Average all chain results for each function
         let n_threads = thread_results.len() / k;
         let mut final_results = vec![0.0f32; k];
 
